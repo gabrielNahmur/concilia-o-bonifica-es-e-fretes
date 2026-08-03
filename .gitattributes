@@ -1,0 +1,12 @@
+* text=auto
+
+# Keep scripts and deployment configuration portable across Windows and Linux.
+*.sh text eol=lf
+*.sql text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+Dockerfile text eol=lf
+
+# Office documents and images are binary assets.
+*.docx binary
+*.png binary
