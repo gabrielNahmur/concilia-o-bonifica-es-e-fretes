@@ -23,6 +23,7 @@ from app.services.reconciliation import _document_discounts_capped, invoice_disc
 from app.services.reconciliation_workspace import (
     CONTRACTUAL_EXCLUSION_REVIEW_STATUS,
     _automatic_policy,
+    _item_status,
     rebuild_reconciliation_workspace,
 )
 from app.services.seed import seed_reference_data
@@ -522,6 +523,26 @@ def test_unit_003_requires_ipiranga_portal_instead_of_credit_utilization():
         assert "exige extrato Ipiranga" in native_reason
         assert portal is True
         assert "portal Ipiranga" in portal_reason
+
+
+def test_unit_003_without_portal_stays_waiting_after_month_due_date():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(BonusRule.unit_code == "003", BonusRule.kind == "distributor_credit")
+        )
+        status = _item_status(
+            rule,
+            {"evidence": []},
+            Decimal("600"),
+            Decimal("0"),
+            date(2026, 4, 30),
+            date(2026, 8, 3),
+            automatic=False,
+        )
+        assert status == "pending"
 
 
 def test_exact_s10_residual_confirms_but_larger_residual_does_not():

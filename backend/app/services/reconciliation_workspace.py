@@ -600,6 +600,16 @@ def _item_status(
         if not details.get("exact_native_chain"):
             return "data_gap"
         return "data_gap"
+    if (
+        rule.kind == "distributor_credit"
+        and rule.unit_code == "003"
+        and rule.company_code == "IPIRANGA"
+        and not any(item.get("source") == "IPIRANGA_PORTAL" for item in payload.get("evidence", []))
+    ):
+        # A ausência do extrato é uma pendência de fonte externa, não um
+        # inadimplemento da distribuidora. Ela permanece aguardando importação
+        # mesmo depois do prazo contratual da competência.
+        return "pending"
     if abs(expected - observed) <= CENT_TOLERANCE and expected > 0:
         return "review_required"
     status = reconciliation_status(expected, observed, due, today, tolerance=CENT_TOLERANCE)
