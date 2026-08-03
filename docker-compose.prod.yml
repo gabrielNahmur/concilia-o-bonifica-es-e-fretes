@@ -1,0 +1,57 @@
+services:
+  contracts_app:
+    image: contracts-gbi:latest
+    build: .
+    container_name: contracts_app
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${CONTRACTS_DB_USER}:${CONTRACTS_DB_PASSWORD}@crm_postgres:5432/${CONTRACTS_DB_NAME}
+      REPORTS_DIR: /app/reports
+    volumes:
+      - contracts_reports:/app/reports
+    expose:
+      - "8000"
+    networks:
+      - crm_network
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 4
+      start_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  contracts_sync:
+    image: contracts-gbi:latest
+    container_name: contracts_sync
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://${CONTRACTS_DB_USER}:${CONTRACTS_DB_PASSWORD}@127.0.0.1:5432/${CONTRACTS_DB_NAME}
+      ERP_DB_SERVER: 127.0.0.1
+      ERP_DB_PORT: 11433
+      REPORTS_DIR: /app/reports
+    volumes:
+      - contracts_reports:/app/reports
+    command: ["python", "-m", "app.scripts.worker"]
+    healthcheck:
+      disable: true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+networks:
+  crm_network:
+    external: true
+    name: crm-gbi-whatsapp_crm_network
+
+volumes:
+  contracts_reports:
