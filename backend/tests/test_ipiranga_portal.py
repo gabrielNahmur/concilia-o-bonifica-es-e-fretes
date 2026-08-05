@@ -291,7 +291,9 @@ def test_contract_parcels_report_reads_only_issued_credits():
 
     assert parsed.client_cnpj == "00905896980008"
     assert parsed.period_start == date(2022, 6, 27)
-    assert parsed.period_end == date(2022, 8, 26)
+    # Scheduled installments must not make an imported statement look newer
+    # than its last issued credit.
+    assert parsed.period_end == date(2022, 7, 26)
     assert len(parsed.events) == 1
     event = parsed.events[0]
     assert event.portal_date == date(2022, 8, 1)

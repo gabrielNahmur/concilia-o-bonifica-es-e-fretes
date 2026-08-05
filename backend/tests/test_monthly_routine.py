@@ -10,6 +10,7 @@ from app.models import (
     BonusRule,
     ManualAdjustment,
     PortalBonusEvent,
+    PortalBonusEventSource,
     PortalBonusMatch,
     PortalStatementImport,
     Purchase,
@@ -366,6 +367,58 @@ def test_monthly_routine_cumulative_uses_allocated_portal_credit_not_residual_wa
         assert card["portal_unallocated_value"] == 50.0
         assert card["difference_value"] == 0.0
         assert card["situation"] == "automatic"
+
+
+def test_monthly_routine_exposes_the_latest_import_and_issued_credit_dates_separately():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        statement_import = PortalStatementImport(
+            unit_code="008",
+            company_code="IPIRANGA",
+            category="contract_parcels_report",
+            client_cnpj="00905896980008",
+            period_start=date(2022, 6, 27),
+            period_end=date(2026, 6, 26),
+            original_filename="portal-008-20260724.xlsx",
+            content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            content_sha256="statement-008".ljust(64, "0"),
+            source_file=b"source",
+            imported_count=48,
+            uploaded_by="admin",
+            created_at=datetime(2026, 7, 24, tzinfo=timezone.utc),
+        )
+        portal_event = PortalBonusEvent(
+            id="portal-008-jun",
+            event_key="portal-008-jun",
+            unit_code="008",
+            company_code="IPIRANGA",
+            category="postpaid",
+            portal_date=date(2026, 6, 28),
+            value=Decimal("4000.00"),
+        )
+        db.add_all([statement_import, portal_event])
+        db.flush()
+        db.add(
+            PortalBonusEventSource(
+                import_id=statement_import.id,
+                event_id=portal_event.id,
+                row_number=48,
+                raw_json="{}",
+            )
+        )
+        db.commit()
+
+        payload = build_monthly_routine(
+            db,
+            reference_months=[date(2026, 7, 1)],
+            today=date(2026, 8, 5),
+        )
+        card = next(row for row in payload["cards"] if row["unit_code"] == "008")
+
+        assert card["latest_import"]["created_at"].date() == date(2026, 7, 24)
+        assert card["latest_import"]["latest_credit_date"] == date(2026, 6, 28)
 
 
 def test_seed_starts_unit_050_s10_bonus_only_in_august_2026():

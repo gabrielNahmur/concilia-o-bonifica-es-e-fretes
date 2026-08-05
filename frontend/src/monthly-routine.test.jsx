@@ -58,7 +58,12 @@ const routinePayload = {
     adjustment_note: "Ajuste histórico aprovado",
     next_statement_expected_value: 0,
     credit_event_count: 2,
-    latest_import: null,
+    latest_import: {
+      original_filename: "portal-008-20260724.xlsx",
+      created_at: "2026-07-24T15:00:00Z",
+      latest_credit_date: "2026-06-28",
+      imported_count: 48,
+    },
     imports: [],
     competencies: [],
     credit_history: [],
@@ -89,5 +94,14 @@ describe("monthly routine cumulative card", () => {
     expect(screen.getByText("R$ 200,00")).toBeInTheDocument();
     expect(screen.getByText(/Crédito residual no portal: R\$ 50,00/)).toBeInTheDocument();
     expect(screen.getByText(/Créditos brutos emitidos: R\$ 250,00/)).toBeInTheDocument();
+  });
+
+  it("shows the import date and the last issued credit instead of a future contract schedule", async () => {
+    render(<MemoryRouter><MonthlyRoutine user={{ id: "viewer", role: "viewer" }} /></MemoryRouter>);
+
+    expect(await screen.findByText(/Último extrato: portal-008-20260724\.xlsx/)).toBeInTheDocument();
+    expect(screen.getByText(/Importado em 24\/07\/2026/)).toBeInTheDocument();
+    expect(screen.getByText(/Créditos emitidos até 28\/06\/2026/)).toBeInTheDocument();
+    expect(screen.queryByText(/26\/06\/2027/)).not.toBeInTheDocument();
   });
 });

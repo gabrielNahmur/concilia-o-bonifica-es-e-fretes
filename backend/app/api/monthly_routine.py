@@ -314,9 +314,18 @@ def _ipiranga_cumulative_card(
     mature_difference = money(mature_expected - identified - historical_adjustment)
     latest_import = max(
         imports,
-        key=lambda item: (item.period_end or date.min, str(item.created_at or "")),
+        key=lambda item: (str(item.created_at or ""), item.period_end or date.min),
         default=None,
     )
+    latest_import_payload = _import_payload(latest_import, users) if latest_import else None
+    if latest_import_payload:
+        latest_import_payload["latest_credit_date"] = db.scalar(
+            select(PortalBonusEvent.portal_date)
+            .join(PortalBonusEventSource, PortalBonusEventSource.event_id == PortalBonusEvent.id)
+            .where(PortalBonusEventSource.import_id == latest_import.id)
+            .order_by(PortalBonusEvent.portal_date.desc())
+            .limit(1)
+        )
 
     if expected <= ZERO:
         situation = "automatic"
@@ -392,7 +401,7 @@ def _ipiranga_cumulative_card(
             }
             for row in reversed(rows[-24:])
         ],
-        "latest_import": _import_payload(latest_import, users) if latest_import else None,
+        "latest_import": latest_import_payload,
         "reconciliation_id": None,
         "confirmation_mode": "automatic" if situation == "automatic" else "none",
         "source_type": "ipiranga_portal",

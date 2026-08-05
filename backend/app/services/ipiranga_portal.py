@@ -494,14 +494,17 @@ def _parse_contract_parcels_report(content: bytes) -> ParsedPortalStatement:
         )
         if not period_start or not period_end:
             raise PortalStatementError(f"Parcela {installment} sem periodo valido na linha {row_number}")
-        overall_start = min(overall_start, period_start) if overall_start else period_start
-        overall_end = max(overall_end, period_end) if overall_end else period_end
         if client_cnpj is None:
             client_cnpj = _cnpj(values[indexes["cnpj"]] if indexes["cnpj"] < len(values) else None)
 
         status = _cell_text(values[indexes["status"]] if indexes["status"] < len(values) else None)
         if _normalized(status) != "credito emitido":
             continue
+        # A parcel report also lists the future schedule.  Its coverage must
+        # reflect only installments with an actually issued credit, otherwise
+        # the operational card can present future contract dates as an extract.
+        overall_start = min(overall_start, period_start) if overall_start else period_start
+        overall_end = max(overall_end, period_end) if overall_end else period_end
         issued_at = _date_value(
             values[indexes["issued_at"]] if indexes["issued_at"] < len(values) else None
         )
