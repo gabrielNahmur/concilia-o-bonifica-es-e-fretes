@@ -191,4 +191,3 @@ Check `/api/monthly-routine` and the reconciliation history using an authenticat
 Run: `pytest backend/tests -q; npm run build --prefix frontend`
 
 Expected: zero failing tests and successful build before deployment.
-

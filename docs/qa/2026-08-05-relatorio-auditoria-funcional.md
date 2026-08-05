@@ -1,7 +1,7 @@
 # Relatório de auditoria funcional — Contratos GBI
 
-Data: 05/08/2026  
-Ambientes: workspace local isolado e produção em modo somente leitura  
+Data: 05/08/2026
+Ambientes: workspace local isolado e produção em modo somente leitura
 URL validada: `https://contratos.atendimento-gbi.online/`
 
 ## Atualização pós-implementação
