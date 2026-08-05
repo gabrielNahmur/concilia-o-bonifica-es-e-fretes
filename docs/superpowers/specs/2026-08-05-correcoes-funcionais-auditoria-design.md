@@ -216,4 +216,3 @@ Depois de testes e build verdes, as rotas afetadas serão verificadas localmente
 - Tarifas e Portal não geram overflow em 390×844 ou 360×800.
 - Drawers não apresentam duas barras de rolagem.
 - Nenhum dado de produção é alterado durante a implementação e validação local.
-
