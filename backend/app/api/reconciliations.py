@@ -8,7 +8,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, File, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
+from sqlalchemy import case, func, select
 
 from app.dependencies import AdminUser, CurrentUser, DbSession
 from app.models import (
@@ -18,6 +18,7 @@ from app.models import (
     Reconciliation,
     ReconciliationAllocation,
     ReconciliationException,
+    ReconciliationInformationRequest,
     ReconciliationItem,
     ReconciliationReview,
 )
@@ -28,6 +29,7 @@ from app.services.reconciliation_detail import build_reconciliation_detail
 from app.services.reconciliation_workspace import recompute_reconciliation_confirmation
 from app.services.reconciliation_workspace import CONTRACTUAL_EXCLUSION_REVIEW_STATUS
 from app.services.rules import money, reconciliation_status
+from app.services.unit_004_portal_usage import is_unit_004_portal_credit_rule
 from app.services.uploads import UploadValidationError, read_validated_upload
 
 
@@ -46,6 +48,10 @@ class AdjustInput(BaseModel):
 class ItemReviewInput(BaseModel):
     action: str = Field(pattern="^(accept|reject|needs_information)$")
     reason_code: str = Field(min_length=3, max_length=50)
+    notes: str = Field(min_length=5, max_length=1500)
+
+
+class InformationRequestResponseInput(BaseModel):
     notes: str = Field(min_length=5, max_length=1500)
 
 
@@ -181,6 +187,48 @@ def _record_review(db, row: Reconciliation, rule: BonusRule, user, action: str, 
     return review
 
 
+def _split_information_request_notes(value: str | None) -> tuple[str, str]:
+    raw = (value or "").strip()
+    if raw.startswith("[") and "]" in raw:
+        reason, notes = raw[1:].split("]", 1)
+        return reason.strip() or "solicitacao_interna", notes.strip() or "Sem justificativa registrada."
+    return "solicitacao_interna", raw or "Sem justificativa registrada."
+
+
+def _legacy_information_request(db, item: ReconciliationItem) -> ReconciliationInformationRequest:
+    reason_code, request_notes = _split_information_request_notes(item.review_notes)
+    request = ReconciliationInformationRequest(
+        reconciliation_id=item.reconciliation_id,
+        item_id=item.id,
+        status="open",
+        reason_code=reason_code[:50],
+        request_notes=request_notes,
+        requested_by=item.reviewed_by or "",
+        requested_at=item.reviewed_at or datetime.now(timezone.utc),
+    )
+    db.add(request)
+    db.flush()
+    return request
+
+
+def _filtered_open_exception_count(db, filters, rule_kind: str | None) -> int:
+    statement = (
+        select(func.count())
+        .select_from(ReconciliationException)
+        .join(Reconciliation, Reconciliation.id == ReconciliationException.reconciliation_id)
+    )
+    if rule_kind:
+        statement = statement.join(BonusRule, BonusRule.id == Reconciliation.rule_id).where(
+            BonusRule.kind == rule_kind
+        )
+    return db.scalar(
+        statement.where(
+            *filters,
+            ReconciliationException.status.in_(("open", "in_review")),
+        )
+    ) or 0
+
+
 @router.get("")
 def reconciliations(
     db: DbSession,
@@ -229,16 +277,13 @@ def reconciliations(
             ),
             "manually_reviewed": sum(1 for item in all_rows if item.confirmed_at is not None),
             "automatically_confirmed": sum(1 for item in all_rows if item.confirmation_mode == "automatic"),
-            "open_exceptions": db.scalar(
-                select(func.count()).select_from(ReconciliationException).where(
-                    ReconciliationException.status.in_(("open", "in_review"))
-                )
-            ) or 0,
+            "open_exceptions": _filtered_open_exception_count(db, filters, rule_kind),
         },
     }
 
 
 INVOICE_COVERAGE_LABELS = {
+    "late_payment": "Pago com atraso",
     "credit_issued_awaiting_payment": "Crédito emitido aguardando baixa",
     "exact_confirmed": "Desconto contratual confirmado",
     "paid_without_discount": "Pagamento integral sem desconto",
@@ -255,6 +300,8 @@ INVOICE_COVERAGE_LABELS = {
 def _invoice_coverage_category(item: ReconciliationItem) -> str:
     details = json.loads(item.details_json or "{}")
     decision_code = details.get("decision_code")
+    if item.status == "late_payment" or decision_code == "late_payment_forfeits_discount":
+        return "late_payment"
     if item.status == "auto_confirmed":
         if details.get("portal_postpaid_exact") or (
             details.get("payment_chain_exact") and details.get("exact_native_chain")
@@ -300,13 +347,15 @@ def _coverage_payload(rows: list[tuple[ReconciliationItem, Reconciliation, Bonus
         + counts.get("unpaid_pending", 0)
         + counts.get("credit_issued_awaiting_payment", 0)
     )
-    deterministic = confirmed + settled_exceptions
+    late_payment = counts.get("late_payment", 0)
+    deterministic = confirmed + settled_exceptions + late_payment
     valid_automatic = confirmed
     integrity_violations = counts.get("integrity_violation", 0)
     return {
         "total_items": total,
         "exact_confirmed": confirmed,
         "settled_exceptions": settled_exceptions,
+        "late_payment": late_payment,
         "waiting_payment": waiting,
         "data_gaps": counts.get("data_gap", 0),
         "deterministic_decisions": deterministic,
@@ -361,6 +410,7 @@ def reconciliation_coverage(
 
 QUEUE_PRIORITY = {"critical": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
 QUEUE_REASON_BY_DECISION = {
+    "late_payment_forfeits_discount": "Título pago após o vencimento; o desconto contratual não é aplicável.",
     "portal_credit_issued_awaiting_payment": (
         "O crédito contratual já foi emitido no portal Texaco e vinculado por valor exato; "
         "o título ainda aguarda baixa financeira."
@@ -377,7 +427,7 @@ QUEUE_REASON_BY_DECISION = {
 
 
 def _queue_state(status: str, due_date: date | None = None) -> str:
-    if status in {"auto_confirmed", "manual_confirmed", "confirmed"}:
+    if status in {"auto_confirmed", "manual_confirmed", "confirmed", "late_payment"}:
         return "confirmed"
     if status == "pending":
         return "waiting"
@@ -417,7 +467,18 @@ def _effective_item_due_date(
         return fallback
 
 
-def _queue_reason(rule: BonusRule, status: str, details: dict, exceptions: list[ReconciliationException]) -> str:
+def _queue_reason(
+    rule: BonusRule,
+    status: str,
+    details: dict,
+    exceptions: list[ReconciliationException],
+    has_management_adjustment: bool = False,
+) -> str:
+    if has_management_adjustment:
+        return (
+            "Competência encerrada por ajuste gerencial histórico aprovado. "
+            "O valor não representa crédito emitido pela distribuidora nem lançamento identificado no ERP."
+        )
     if status in {"auto_confirmed", "manual_confirmed", "confirmed"}:
         return "Conciliação confirmada: o valor identificado fecha o esperado e a prova vinculada foi preservada."
     if exceptions:
@@ -454,7 +515,12 @@ def _queue_action(
     status: str,
     details: dict,
     exceptions: list[ReconciliationException],
+    has_management_adjustment: bool = False,
 ) -> str:
+    if has_management_adjustment:
+        return "Ajuste histórico registrado"
+    if status == "late_payment":
+        return "Pago com atraso"
     if state == "confirmed":
         return "Conferência concluída"
     if rule.kind == "distributor_credit" and state == "waiting":
@@ -486,6 +552,7 @@ def reconciliation_work_queue(
     company: list[str] | None = Query(None),
     rule_kind: list[str] | None = Query(None),
     reference_month: list[str] | None = Query(None),
+    state: list[str] | None = Query(None),
     scope: str = Query("actionable", pattern="^(actionable|waiting|confirmed|all)$"),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=200),
@@ -495,22 +562,29 @@ def reconciliation_work_queue(
     companies = {value.upper() for value in _filter_values(company)}
     rule_kinds = set(_filter_values(rule_kind))
     reference_months = _filter_months(reference_month)
+    states = set(_filter_values(state))
+    allowed_states = {"actionable", "waiting", "confirmed"}
+    invalid_states = states - allowed_states
+    if invalid_states:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Situação inválida: {', '.join(sorted(invalid_states))}.",
+        )
     rules = {item.id: item for item in db.scalars(select(BonusRule)).all()}
     reconciliations = db.scalars(
         select(Reconciliation).where(
             Reconciliation.status != "superseded",
-            Reconciliation.expected_value > 0,
         )
     ).all()
     reconciliation_ids = [item.id for item in reconciliations]
-    invoice_items = db.scalars(
+    granular_items = db.scalars(
         select(ReconciliationItem).where(
             ReconciliationItem.reconciliation_id.in_(reconciliation_ids) if reconciliation_ids else False,
-            ReconciliationItem.item_type == "invoice",
+            ReconciliationItem.item_type.in_(("invoice", "portal_credit_usage")),
         )
     ).all()
     items_by_reconciliation: dict[str, list[ReconciliationItem]] = {}
-    for item in invoice_items:
+    for item in granular_items:
         items_by_reconciliation.setdefault(item.reconciliation_id, []).append(item)
     exceptions = db.scalars(
         select(ReconciliationException).where(
@@ -538,14 +612,30 @@ def reconciliation_work_queue(
             continue
         if reference_months and reconciliation.reference_month not in reference_months:
             continue
-        # A few legacy invoice reconciliations predate granular items.  Keep
+        # A few legacy invoice reconciliations predate granular items. Keep
         # them visible as one aggregate line instead of silently losing them
-        # from the operational queue.
-        source_items = (items_by_reconciliation.get(reconciliation.id) or [None]) if rule.kind == "invoice_discount" else [None]
+        # from the operational queue. Unit 004 is deliberately different: its
+        # approved proof is the accumulated Ipiranga statement, so only a
+        # portal credit explicitly declared by Ipiranga can enter this queue.
+        if rule.kind == "invoice_discount":
+            source_items = items_by_reconciliation.get(reconciliation.id) or [None]
+        elif is_unit_004_portal_credit_rule(rule):
+            source_items = items_by_reconciliation.get(reconciliation.id) or []
+        else:
+            source_items = [None]
         for item in source_items:
             if item and item.review_status == CONTRACTUAL_EXCLUSION_REVIEW_STATUS:
                 continue
             details = json.loads(item.details_json or "{}") if item else {}
+            try:
+                reconciliation_evidence = json.loads(reconciliation.evidence_json or "[]")
+            except (TypeError, json.JSONDecodeError):
+                reconciliation_evidence = []
+            has_management_adjustment = any(
+                evidence.get("source") == "MANAGEMENT_ADJUSTMENT"
+                for evidence in reconciliation_evidence
+                if isinstance(evidence, dict)
+            )
             status = item.status if item else reconciliation.status
             expected = Decimal(item.expected_value) if item else Decimal(reconciliation.expected_value)
             observed = Decimal(item.observed_value) if item else Decimal(reconciliation.observed_value) + Decimal(reconciliation.manual_adjustment or 0)
@@ -557,7 +647,13 @@ def reconciliation_work_queue(
             # decision.  Legacy granular rows can exist below a month that has
             # other valid notes, so filter at item level as well as at the
             # aggregate-reconciliation query above.
-            if expected <= Decimal("0.00") and observed <= Decimal("0.00") and difference == Decimal("0.00") and not related_exceptions:
+            if (
+                expected <= Decimal("0.00")
+                and observed <= Decimal("0.00")
+                and difference == Decimal("0.00")
+                and status != "late_payment"
+                and not related_exceptions
+            ):
                 continue
             effective_due_date = _effective_item_due_date(item, reconciliation.due_date, details)
             state = _queue_state(status, effective_due_date)
@@ -572,6 +668,7 @@ def reconciliation_work_queue(
                     "unit_code": reconciliation.unit_code,
                     "company_code": rule.company_code,
                     "rule_kind": rule.kind,
+                    "item_type": item.item_type if item else None,
                     "source_date": item.source_date if item and item.source_date else reconciliation.reference_month,
                     "reference_month": reconciliation.reference_month,
                     "document": item.source_document if item else None,
@@ -579,12 +676,21 @@ def reconciliation_work_queue(
                     "expected_value": float(money(expected)),
                     "observed_value": float(money(observed)),
                     "difference_value": float(money(difference)),
+                    "contractual_value": (
+                        float(money(Decimal(str(details.get("contractual_expected_value") or 0))))
+                        if status == "late_payment"
+                        else None
+                    ),
                     "due_date": effective_due_date,
                     "status": status,
                     "state": state,
                     "priority": next((name for name, value in QUEUE_PRIORITY.items() if value == severity), "low"),
-                    "reason": _queue_reason(rule, status, details, related_exceptions),
-                    "action_label": _queue_action(rule, state, status, details, related_exceptions),
+                    "reason": _queue_reason(
+                        rule, status, details, related_exceptions, has_management_adjustment
+                    ),
+                    "action_label": _queue_action(
+                        rule, state, status, details, related_exceptions, has_management_adjustment
+                    ),
                     "open_exception_count": len(related_exceptions),
                     "in_review": any(entry.status == "in_review" for entry in related_exceptions),
                     "confirmation_mode": reconciliation.confirmation_mode,
@@ -595,10 +701,14 @@ def reconciliation_work_queue(
         "to_treat": sum(item["state"] == "actionable" for item in rows),
         "value_at_risk": float(sum((abs(Decimal(str(item["difference_value"]))) for item in rows if item["state"] == "actionable"), Decimal("0"))),
         "in_review": sum(item["in_review"] for item in rows),
-        "confirmed": sum(item["state"] == "confirmed" for item in rows),
+        "waiting": sum(item["state"] == "waiting" for item in rows),
+        "confirmed": sum(item["state"] == "confirmed" and item["status"] != "late_payment" for item in rows),
+        "late_payment": sum(item["status"] == "late_payment" for item in rows),
         "confirmed_value": float(sum((Decimal(str(item["observed_value"])) for item in rows if item["state"] == "confirmed"), Decimal("0"))),
     }
-    if scope != "all":
+    if states:
+        rows = [item for item in rows if item["state"] in states]
+    elif scope != "all":
         rows = [item for item in rows if item["state"] == scope]
     # The queue is a current operational view: newest competence/NF first.
     # Severity still orders items that share the same source date.
@@ -618,6 +728,7 @@ def reconciliation_work_queue(
         "page": page,
         "pages": (total + page_size - 1) // page_size,
         "scope": scope,
+        "states": sorted(states),
         "summary": summary,
     }
 
@@ -651,9 +762,16 @@ def exception_queue(
         statement = statement.where(ReconciliationException.severity == severity)
     if exception_type:
         statement = statement.where(ReconciliationException.exception_type == exception_type)
+    severity_rank = case(
+        (ReconciliationException.severity == "critical", 0),
+        (ReconciliationException.severity == "high", 1),
+        (ReconciliationException.severity == "medium", 2),
+        (ReconciliationException.severity == "low", 3),
+        else_=4,
+    )
     rows = db.execute(
         statement.order_by(
-            ReconciliationException.severity.desc(),
+            severity_rank,
             Reconciliation.due_date,
             Reconciliation.unit_code,
             ReconciliationException.created_at,
@@ -747,6 +865,31 @@ def review_item(item_id: str, payload: ItemReviewInput, db: DbSession, user: Adm
     else:
         item.review_status = "needs_information"
         item.status = "review_required"
+        active_request = db.scalar(
+            select(ReconciliationInformationRequest)
+            .where(
+                ReconciliationInformationRequest.item_id == item.id,
+                ReconciliationInformationRequest.status == "open",
+            )
+            .order_by(ReconciliationInformationRequest.requested_at.desc())
+        )
+        if active_request:
+            active_request.reason_code = payload.reason_code
+            active_request.request_notes = payload.notes
+            active_request.requested_by = user.id
+            active_request.requested_at = item.reviewed_at
+        else:
+            db.add(
+                ReconciliationInformationRequest(
+                    reconciliation_id=row.id,
+                    item_id=item.id,
+                    status="open",
+                    reason_code=payload.reason_code,
+                    request_notes=payload.notes,
+                    requested_by=user.id,
+                    requested_at=item.reviewed_at,
+                )
+            )
     exceptions = db.scalars(
         select(ReconciliationException).where(
             ReconciliationException.item_id == item.id,
@@ -773,6 +916,76 @@ def review_item(item_id: str, payload: ItemReviewInput, db: DbSession, user: Adm
     audit(db, user, f"item_{payload.action}", "reconciliation_item", item.id, payload.model_dump())
     db.commit()
     return build_reconciliation_detail(db, row, db.get(BonusRule, row.rule_id))
+
+
+@router.post("/information-requests/{request_id}/respond")
+def respond_information_request(
+    request_id: str,
+    payload: InformationRequestResponseInput,
+    db: DbSession,
+    user: AdminUser,
+):
+    if request_id.startswith("legacy:"):
+        item = db.get(ReconciliationItem, request_id.removeprefix("legacy:"))
+        if not item or item.review_status != "needs_information":
+            raise HTTPException(status_code=404, detail="Solicitação de informação não encontrada")
+        request = db.scalar(
+            select(ReconciliationInformationRequest)
+            .where(
+                ReconciliationInformationRequest.item_id == item.id,
+                ReconciliationInformationRequest.status == "open",
+            )
+            .order_by(ReconciliationInformationRequest.requested_at.desc())
+        ) or _legacy_information_request(db, item)
+    else:
+        request = db.get(ReconciliationInformationRequest, request_id)
+        if not request:
+            raise HTTPException(status_code=404, detail="Solicitação de informação não encontrada")
+        item = db.get(ReconciliationItem, request.item_id)
+    if request.status != "open":
+        raise HTTPException(status_code=409, detail="Esta solicitação já foi encerrada")
+    if not item:
+        raise HTTPException(status_code=404, detail="Item conciliável não encontrado")
+
+    row = db.get(Reconciliation, request.reconciliation_id)
+    now = datetime.now(timezone.utc)
+    request.status = "closed"
+    request.response_notes = payload.notes
+    request.responded_by = user.id
+    request.responded_at = now
+    request.closed_by = user.id
+    request.closed_at = now
+
+    # Encerrar a conversa interna não confirma nenhum valor nem resolve a cobrança.
+    item.review_status = "pending"
+    item.reviewed_by = None
+    item.reviewed_at = None
+    item.review_notes = None
+    for exception in db.scalars(
+        select(ReconciliationException).where(
+            ReconciliationException.item_id == item.id,
+            ReconciliationException.status == "in_review",
+        )
+    ).all():
+        exception.status = "open"
+        exception.assigned_to = None
+        exception.resolution_code = None
+        exception.resolution_notes = None
+
+    recompute_reconciliation_confirmation(db, row)
+    db.flush()
+    rule = db.get(BonusRule, row.rule_id)
+    _record_review(db, row, rule, user, "item_information_response", payload.notes)
+    audit(
+        db,
+        user,
+        "item_information_response",
+        "reconciliation_information_request",
+        request.id,
+        {"item_id": item.id, "notes": payload.notes},
+    )
+    db.commit()
+    return build_reconciliation_detail(db, row, rule)
 
 
 @router.post("/exceptions/{exception_id}/action")

@@ -22,10 +22,13 @@ from app.models import (
     ReconciliationAllocation,
     ReconciliationEvidence,
     ReconciliationException,
+    ReconciliationInformationRequest,
     ReconciliationItem,
     ReconciliationReview,
     User,
 )
+from app.services.management_adjustments import full_management_adjustment
+from app.services.reconciliation import invoice_discount_forfeited_by_late_payment
 from app.services.rules import UmbrellaPurchase, allocate_umbrella, money, month_end, month_start
 
 
@@ -79,6 +82,14 @@ def _iso(value) -> str | None:
     return value.isoformat() if value else None
 
 
+def _legacy_request_notes(value: str | None) -> tuple[str, str]:
+    raw = (value or "").strip()
+    if raw.startswith("[") and "]" in raw:
+        reason, notes = raw[1:].split("]", 1)
+        return reason.strip() or "solicitacao_interna", notes.strip() or "Sem justificativa registrada."
+    return "solicitacao_interna", raw or "Sem justificativa registrada."
+
+
 def _formula(rule: BonusRule) -> str:
     if rule.kind == "milestone_bonus":
         return f"Cada {float(rule.milestone_liters or 440000):,.0f} L cumulativos libera R$ {float(rule.milestone_amount or 35000):,.2f}."
@@ -93,7 +104,16 @@ def _formula(rule: BonusRule) -> str:
     return f"Litros elegíveis multiplicados por R$ {float(rule.rate_per_liter):.6f}/L."
 
 
-def _bonus_match_criterion(rule: BonusRule, row: Reconciliation) -> dict:
+def _bonus_match_criterion(db: Session, rule: BonusRule, row: Reconciliation) -> dict:
+    if full_management_adjustment(db, row):
+        return {
+            "step": "Ajuste histórico -> Competência",
+            "basis": (
+                "Competência encerrada por decisão gerencial auditada. O valor não é apresentado "
+                "como crédito emitido pela distribuidora nem como lançamento identificado no ERP."
+            ),
+            "quality": "manual",
+        }
     quality = "exact" if row.confidence == "direct" else "probable" if row.confidence == "probable" else "missing"
     if rule.kind == "invoice_discount":
         basis = (
@@ -111,11 +131,29 @@ def _bonus_match_criterion(rule: BonusRule, row: Reconciliation) -> dict:
             item for item in json.loads(row.evidence_json or "[]")
             if item.get("source") == "IPIRANGA_PORTAL"
         ]
-        if portal_evidence:
+        cycle_evidence = [
+            item for item in json.loads(row.evidence_json or "[]")
+            if item.get("source") == "IPIRANGA_PORTAL_CYCLE"
+        ]
+        unassigned_portal_evidence = [
+            item for item in json.loads(row.evidence_json or "[]")
+            if item.get("source") == "unassigned_portal_credit"
+        ]
+        if cycle_evidence:
+            basis = (
+                "Crédito postecipado explicitamente listado no extrato Ipiranga e atribuído somente "
+                "quando uma sequência cronológica única de NFs fecha o valor a R$ 0,07/L."
+            )
+        elif portal_evidence:
             basis = (
                 "Credito postecipado explicitamente listado no extrato do portal Ipiranga. Quando existir, "
                 "a cadeia de mesmo valor/data para MDCMP, titulo, baixa, nota e 6204 e exibida como prova "
                 "adicional de utilizacao; sua ausencia nao descaracteriza o credito concedido no portal."
+            )
+        elif unassigned_portal_evidence:
+            basis = (
+                "O extrato Ipiranga comprova a emissao de credito, mas nao informa a competencia liquidada. "
+                "O credito permanece visivel como saldo nao atribuido e nao fecha automaticamente este mes."
             )
     elif rule.kind == "s10_excess_credit":
         basis = (
@@ -245,7 +283,7 @@ def _enrich_evidence(
     for raw in evidence:
         source = raw.get("source")
         item = {"source": source, "technical": raw}
-        if source == "IPIRANGA_PORTAL":
+        if source in {"IPIRANGA_PORTAL", "IPIRANGA_PORTAL_CYCLE", "IPIRANGA_PORTAL_USAGE"}:
             portal_company = str(raw.get("company_code") or "IPIRANGA").upper()
             portal_name = {"TEXACO": "Texaco", "IPIRANGA": "Ipiranga"}.get(
                 portal_company, "da distribuidora"
@@ -253,14 +291,33 @@ def _enrich_evidence(
             item.update(
                 {
                     "kind": "portal",
-                    "label": f"Bonificação postecipada no portal {portal_name}",
+                    "label": (
+                        f"Crédito postecipado usado no portal {portal_name}"
+                        if source == "IPIRANGA_PORTAL_USAGE"
+                        else f"Ciclo único de NFs no portal {portal_name}"
+                        if source == "IPIRANGA_PORTAL_CYCLE"
+                        else f"Bonificação postecipada no portal {portal_name}"
+                    ),
                     "record_id": str(raw.get("id") or ""),
                     "date": raw.get("date"),
                     "document": raw.get("document"),
                     "value": _number(raw.get("allocated") or raw.get("value")),
                     "history": (
-                        f"Evento do portal; NF {raw.get('invoice_number') or '—'}; "
-                        f"entrada ERP {raw.get('purchase_entry_id') or '—'}"
+                        (
+                            f"NF {raw.get('document') or raw.get('invoice_number') or '—'} declarada pelo portal como uso do crédito; "
+                            "este vínculo comprova a utilização e não identifica a compra que gerou a bonificação."
+                        )
+                        if source == "IPIRANGA_PORTAL_USAGE"
+                        else (
+                            f"Crédito do ciclo em {raw.get('cycle_start')} a {raw.get('cycle_end')}; "
+                            f"{raw.get('cycle_purchase_count') or 0} NFs e "
+                            f"{raw.get('cycle_liters') or 0:,.3f} L."
+                        )
+                        if source == "IPIRANGA_PORTAL_CYCLE"
+                        else (
+                            f"Evento do portal; NF {raw.get('invoice_number') or '—'}; "
+                            f"entrada ERP {raw.get('purchase_entry_id') or '—'}"
+                        )
                     ),
                     "match_basis": raw.get("match_basis"),
                 }
@@ -401,6 +458,22 @@ def _enrich_evidence(
                     "match_basis": "Exibido para revisão, sem compor o valor confirmado.",
                 }
             )
+        elif source == "unassigned_portal_credit":
+            item.update(
+                {
+                    "kind": "portal",
+                    "label": "Crédito do portal sem competência informada",
+                    "record_id": str(raw.get("id") or ""),
+                    "date": raw.get("date"),
+                    "document": raw.get("document"),
+                    "value": _number(raw.get("value")),
+                    "history": raw.get("reason"),
+                    "match_basis": (
+                        "Extrato da Ipiranga preservado para auditoria; não compõe o valor "
+                        "identificado sem a competência explícita da distribuidora."
+                    ),
+                }
+            )
         elif source == "BOLETO_PDF":
             boleto = db.get(InvoiceBoletoEvidence, str(raw.get("id"))) if raw.get("id") else None
             item.update(
@@ -442,6 +515,21 @@ def _enrich_evidence(
                     "value": _number(raw.get("informative_value")),
                     "history": "Campo Vlr_OutAbt; não usado como confirmação da bonificação.",
                     "match_basis": "Mesmo documento financeiro",
+                }
+            )
+        elif source == "MANAGEMENT_ADJUSTMENT":
+            item.update(
+                {
+                    "kind": "adjustment",
+                    "label": "Ajuste gerencial histórico",
+                    "record_id": str(raw.get("id") or ""),
+                    "date": raw.get("date"),
+                    "document": None,
+                    "value": _number(raw.get("value")),
+                    "history": raw.get("reason"),
+                    "match_basis": raw.get("match_basis") or (
+                        "Decisão gerencial auditada; não representa crédito da distribuidora ou lançamento do ERP."
+                    ),
                 }
             )
         else:
@@ -486,7 +574,7 @@ def _allocation_evidence_payload(
     )
     if allocation.match_basis and not raw.get("match_basis"):
         raw["match_basis"] = allocation.match_basis
-    if evidence.source_type == "IPIRANGA_PORTAL" and item:
+    if evidence.source_type in {"IPIRANGA_PORTAL", "IPIRANGA_PORTAL_CYCLE"} and item:
         # The portal can issue a single consolidated credit for several NFs.
         # The operations drawer is scoped to one NF, therefore it must show
         # only that NF's exact share, never a sibling title or the event total.
@@ -501,7 +589,12 @@ def _allocation_evidence_payload(
                 "allocated": allocated,
             }
         )
-        if details.get("portal_credit_issued"):
+        if evidence.source_type == "IPIRANGA_PORTAL_CYCLE":
+            raw["match_basis"] = (
+                "Ciclo Ipiranga único: a sequência de NFs em ordem cronológica fecha "
+                "o crédito postecipado a R$ 0,07/L, sem reutilização do evento."
+            )
+        elif details.get("portal_credit_issued"):
             # ``ReconciliationEvidence`` is intentionally shared by all
             # allocations of one consolidated portal event.  Its raw snapshot
             # can therefore describe a paid sibling NF.  The open/settled
@@ -769,6 +862,14 @@ def build_reconciliation_detail(db: Session, row: Reconciliation, rule: BonusRul
             elif len(purchase_documents) != 1:
                 chain_status = "data_gap"
                 decision_reason = "Mais de um título ligado à mesma entrada; vínculo não único."
+            elif invoice_discount_forfeited_by_late_payment(rule, purchase_documents):
+                title = purchase_documents[0]
+                late_days = (title.payment_date - title.due_date).days
+                chain_status = "late_payment"
+                decision_reason = (
+                    f"Título liquidado {late_days} dia(s) após o vencimento; "
+                    "o desconto contratual não é aplicável."
+                )
             elif not document_payload[0]["is_paid"]:
                 chain_status = "pending_payment"
                 decision_reason = "Título ainda sem baixa no ERP."
@@ -889,6 +990,11 @@ def build_reconciliation_detail(db: Session, row: Reconciliation, rule: BonusRul
         .order_by(ReconciliationItem.source_date, ReconciliationItem.source_document, ReconciliationItem.id)
     ).all()
     workspace_item_ids = [item.id for item in workspace_items]
+    information_request_rows = db.scalars(
+        select(ReconciliationInformationRequest)
+        .where(ReconciliationInformationRequest.reconciliation_id == row.id)
+        .order_by(ReconciliationInformationRequest.requested_at.desc(), ReconciliationInformationRequest.id.desc())
+    ).all()
     workspace_allocations = db.scalars(
         select(ReconciliationAllocation).where(
             ReconciliationAllocation.item_id.in_(workspace_item_ids) if workspace_item_ids else False
@@ -932,9 +1038,55 @@ def build_reconciliation_detail(db: Session, row: Reconciliation, rule: BonusRul
     if row.confirmed_by:
         user_ids.add(row.confirmed_by)
     user_ids.update(item.reviewed_by for item in workspace_items if item.reviewed_by)
+    user_ids.update(item.requested_by for item in information_request_rows if item.requested_by)
+    user_ids.update(item.responded_by for item in information_request_rows if item.responded_by)
+    user_ids.update(item.closed_by for item in information_request_rows if item.closed_by)
     user_ids.update(item.assigned_to for item in workspace_exceptions if item.assigned_to)
     user_ids.update(item.resolved_by for item in workspace_exceptions if item.resolved_by)
     users = {item.id: item for item in db.scalars(select(User).where(User.id.in_(user_ids) if user_ids else False)).all()}
+    workspace_items_by_id = {item.id: item for item in workspace_items}
+    information_requests = [
+        {
+            "id": request.id,
+            "item_id": request.item_id,
+            "document": (workspace_items_by_id.get(request.item_id).source_document if request.item_id in workspace_items_by_id else None) or "Competência",
+            "status": request.status,
+            "reason_code": request.reason_code,
+            "request_notes": request.request_notes,
+            "requested_by": users.get(request.requested_by).full_name if request.requested_by in users else request.requested_by or "Administrador",
+            "requested_at": _iso(request.requested_at),
+            "response": request.response_notes,
+            "responded_by": users.get(request.responded_by).full_name if request.responded_by in users else request.responded_by,
+            "responded_at": _iso(request.responded_at),
+            "closed_by": users.get(request.closed_by).full_name if request.closed_by in users else request.closed_by,
+            "closed_at": _iso(request.closed_at),
+            "legacy": False,
+        }
+        for request in information_request_rows
+    ]
+    active_request_item_ids = {request.item_id for request in information_request_rows if request.status == "open"}
+    for item in workspace_items:
+        if item.review_status != "needs_information" or item.id in active_request_item_ids:
+            continue
+        reason_code, request_notes = _legacy_request_notes(item.review_notes)
+        information_requests.append(
+            {
+                "id": f"legacy:{item.id}",
+                "item_id": item.id,
+                "document": item.source_document or "Competência",
+                "status": "open",
+                "reason_code": reason_code,
+                "request_notes": request_notes,
+                "requested_by": users.get(item.reviewed_by).full_name if item.reviewed_by in users else item.reviewed_by or "Administrador",
+                "requested_at": _iso(item.reviewed_at),
+                "response": None,
+                "responded_by": None,
+                "responded_at": None,
+                "closed_by": None,
+                "closed_at": None,
+                "legacy": True,
+            }
+        )
 
     purchase_count = len(purchases)
     document_count = len(documents)
@@ -1010,11 +1162,12 @@ def build_reconciliation_detail(db: Session, row: Reconciliation, rule: BonusRul
             {"step": "Entrada ERP -> Título", "basis": "Vínculo exato MDCDP.Cd_Entrada = MDCHP.Cd_Entrada.", "quality": "exact"},
             {"step": "Título -> Baixa/desconto", "basis": "Chave completa MDCDP/MDCMP: unidade, fornecedor, tipo, documento e parcela; baixa identificada por Sq_Baixa.", "quality": "exact"},
             {"step": "MDCMP -> Financeiro", "basis": "Cd_LancFin, unidade, documento e valor ligam a baixa ao histórico 51 e o desconto ao 6204; divergência ou vínculo não único nunca confirma.", "quality": "exact"},
-            _bonus_match_criterion(rule, row),
+            _bonus_match_criterion(db, rule, row),
         ],
         "erp_order_note": "O módulo de entrada de combustível não expõe um número de pedido de compra próprio. A referência operacional comprovável é MDCHP.Cd_Entrada, exibida como Entrada ERP.",
         "chains": chains,
         "evidence": evidence,
+        "information_requests": information_requests,
         "workspace": {
             "items": [
                 {
@@ -1042,7 +1195,10 @@ def build_reconciliation_detail(db: Session, row: Reconciliation, rule: BonusRul
                         [
                             _allocation_evidence_payload(workspace_evidence[allocation.evidence_id], allocation, item)
                             for allocation in allocations_by_item.get(item.id, [])
-                            if allocation.evidence_id in workspace_evidence
+                            if (
+                                allocation.evidence_id in workspace_evidence
+                                and abs(_decimal(allocation.allocated_value)) > ZERO
+                            )
                         ],
                         rule,
                     ),

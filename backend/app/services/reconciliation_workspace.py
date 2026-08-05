@@ -24,9 +24,14 @@ from app.models import (
 )
 from app.services.reconciliation import invoice_discount_forfeited_by_late_payment
 from app.services.rules import money, month_end, month_start, reconciliation_status
+from app.services.unit_004_portal_usage import (
+    is_unit_004_portal_credit_rule,
+    unit_004_portal_usage_events,
+)
+from app.services.management_adjustments import full_management_adjustment
 
 
-ALGORITHM_VERSION = "value-evidence-v3.7-raizen"
+ALGORITHM_VERSION = "value-evid-v3.9-004portal"
 # Valores já chegam quantizados em centavos. A política aprovada considera a
 # conciliação concluída quando as evidências vinculadas fecham exatamente o
 # valor esperado; os elos técnicos disponíveis seguem exibidos para auditoria.
@@ -39,6 +44,7 @@ NON_COUNTED_SOURCES = {
     "calculation",
     "accounting_accrual",
     "unclassified_credit",
+    "unassigned_portal_credit",
     "MDCDP.Vlr_OutAbt",
     "BOLETO_PDF",
 }
@@ -250,8 +256,153 @@ def _has_exact_payment(
     return len(matches) == 1 and _payment_corroboration_is_exact(db, matches[0])
 
 
+def _is_unit_004_nf_cycle_rule(rule: BonusRule) -> bool:
+    return (
+        rule.unit_code == "004"
+        and rule.company_code == "IPIRANGA"
+        and rule.kind == "distributor_credit"
+    )
+
+
+def _unit_004_nf_cycle_payloads(
+    db: Session,
+    row: Reconciliation,
+    rule: BonusRule,
+    raw_evidence: list[dict],
+) -> list[dict]:
+    """Expose the 004 portal cycle as one auditable item per purchase NF."""
+    purchases = db.scalars(
+        select(Purchase)
+        .options(selectinload(Purchase.items))
+        .where(
+            Purchase.unit_code == row.unit_code,
+            Purchase.mapped_company_code == rule.company_code,
+            Purchase.purchase_date >= month_start(row.reference_month),
+            Purchase.purchase_date <= month_end(row.reference_month),
+            Purchase.purchase_date >= rule.effective_from,
+        )
+        .order_by(Purchase.purchase_date, Purchase.erp_entry_id)
+    ).all()
+    evidence_by_entry: dict[int, list[dict]] = defaultdict(list)
+    for evidence in raw_evidence:
+        if evidence.get("source") != "IPIRANGA_PORTAL_CYCLE":
+            continue
+        try:
+            entry_id = int(evidence.get("purchase_entry_id"))
+        except (TypeError, ValueError):
+            continue
+        evidence_by_entry[entry_id].append(evidence)
+
+    payloads = []
+    for purchase in purchases:
+        expected = money(_eligible_liters(purchase, rule) * _decimal(rule.rate_per_liter))
+        if expected <= 0:
+            continue
+        evidence = evidence_by_entry.get(purchase.erp_entry_id, [])
+        cycle_exact = bool(evidence) and all(
+            item.get("portal_cycle_match_status") == "unique_contiguous_nf_cycle"
+            and item.get("portal_cycle_exact") is True
+            and money(_decimal(item.get("allocated"))) == expected
+            for item in evidence
+        )
+        first = evidence[0] if cycle_exact else {}
+        payloads.append(
+            {
+                "source_key": f"portal-cycle-purchase:{purchase.erp_entry_id}",
+                "item_type": "portal_cycle_invoice",
+                "source_date": purchase.purchase_date,
+                "source_document": purchase.invoice_number or str(purchase.erp_entry_id),
+                "description": (
+                    f"NF {purchase.invoice_number or purchase.erp_entry_id} - ciclo Ipiranga confirmado"
+                    if cycle_exact
+                    else f"NF {purchase.invoice_number or purchase.erp_entry_id} - aguardando ciclo Ipiranga"
+                ),
+                "expected": expected,
+                "evidence": evidence,
+                "details": {
+                    "erp_entry_id": purchase.erp_entry_id,
+                    "invoice_number": purchase.invoice_number,
+                    "access_key": purchase.access_key,
+                    "eligible_liters": float(_eligible_liters(purchase, rule)),
+                    "portal_cycle_exact": cycle_exact,
+                    "portal_cycle_event_date": first.get("date"),
+                    "portal_cycle_start": first.get("cycle_start"),
+                    "portal_cycle_end": first.get("cycle_end"),
+                    "portal_cycle_liters": first.get("cycle_liters"),
+                    "portal_cycle_purchase_count": first.get("cycle_purchase_count"),
+                    "portal_cycle_invoices": first.get("cycle_invoices") or [],
+                    "portal_cycle_credit_value": first.get("cycle_credit_value"),
+                    "decision_code": (
+                        "portal_unique_nf_cycle"
+                        if cycle_exact
+                        else "awaiting_unique_nf_cycle"
+                    ),
+                },
+                "automatic_kind": False,
+            }
+        )
+    return payloads
+
+
+def _unit_004_portal_usage_payloads(
+    db: Session, row: Reconciliation, rule: BonusRule
+) -> list[dict]:
+    """Materialize a confirmed portal credit once, not every possible origin NF."""
+    payloads = []
+    for usage in unit_004_portal_usage_events(db, rule):
+        if month_start(usage.event.portal_date) != row.reference_month:
+            continue
+        value = money(_decimal(usage.event.value))
+        evidence = {
+            "source": "IPIRANGA_PORTAL_USAGE",
+            "id": usage.event.id,
+            "date": usage.event.portal_date.isoformat(),
+            "document": usage.purchase.invoice_number or str(usage.purchase.erp_entry_id),
+            "value": float(value),
+            "source_value": float(value),
+            "allocated": float(value),
+            "purchase_entry_id": usage.purchase.erp_entry_id,
+            "invoice_number": usage.purchase.invoice_number,
+            "access_key": usage.details.get("usage_access_key") or usage.purchase.access_key,
+            "match_basis": usage.match.match_basis,
+            "portal_usage_confirmed": True,
+        }
+        payloads.append(
+            {
+                "source_key": f"portal-usage:{usage.event.id}",
+                "item_type": "portal_credit_usage",
+                "source_date": usage.event.portal_date,
+                "source_document": usage.purchase.invoice_number or str(usage.purchase.erp_entry_id),
+                "description": (
+                    f"Crédito Ipiranga de R$ {value:,.2f} utilizado na NF "
+                    f"{usage.purchase.invoice_number or usage.purchase.erp_entry_id}"
+                ),
+                "expected": value,
+                "evidence": [evidence],
+                "details": {
+                    "aggregate": True,
+                    "portal_credit_usage": True,
+                    "portal_date": usage.event.portal_date.isoformat(),
+                    "used_purchase_entry_id": usage.purchase.erp_entry_id,
+                    "used_invoice_number": usage.purchase.invoice_number,
+                    "used_invoice_access_key": evidence["access_key"],
+                    "decision_code": "portal_usage_explicit",
+                },
+                "automatic_kind": True,
+            }
+        )
+    return payloads
+
+
 def _base_item_payloads(db: Session, row: Reconciliation, rule: BonusRule):
+    # A full historical management adjustment is an audited scope decision,
+    # not a financial proof. Do not materialize a stale automatic item whose
+    # rejected portal allocations would make the confirmed total misleading.
+    if full_management_adjustment(db, row):
+        return []
     raw_evidence = _evidence_for_rule(rule, json.loads(row.evidence_json or "[]"))
+    if is_unit_004_portal_credit_rule(rule):
+        return _unit_004_portal_usage_payloads(db, row, rule)
     if rule.kind != "invoice_discount":
         # A zero/zero month carries no financial action.  It is deliberately
         # absent from the operational queue rather than labelled as pending.
@@ -326,15 +477,16 @@ def _base_item_payloads(db: Session, row: Reconciliation, rule: BonusRule):
         raw_discount = money(sum((abs(_decimal(item.amount)) for item in discounts), Decimal("0")))
         documents = docs_by_entry.get(purchase.erp_entry_id, [])
         lost_due_to_late_payment = invoice_discount_forfeited_by_late_payment(rule, documents)
+        contractual_expected = money(_eligible_liters(purchase, rule) * _decimal(rule.rate_per_liter))
         expected = (
             Decimal("0")
             if lost_due_to_late_payment
-            else money(_eligible_liters(purchase, rule) * _decimal(rule.rate_per_liter))
+            else contractual_expected
         )
-        # A zero expected value (including a discount forfeited by late
-        # payment) is retained in the ERP/audit data but is not a conciliable
-        # financial item. Showing it as "a tratar" creates a false alert.
-        if expected <= 0:
+        # A zero expected value has no operational decision, except for a
+        # title paid after its due date. That case is retained as an auditable
+        # non-chargeable result in the historical queue.
+        if expected <= 0 and not lost_due_to_late_payment:
             continue
         paid_document_count = sum(
             bool(item.payment_date) or _decimal(item.balance) == 0
@@ -401,7 +553,7 @@ def _base_item_payloads(db: Session, row: Reconciliation, rule: BonusRule):
                 "source_date": purchase.purchase_date,
                 "source_document": purchase.invoice_number or str(purchase.erp_entry_id),
                 "description": (
-                    f"NF {purchase.invoice_number or purchase.erp_entry_id} - beneficio perdido por pagamento apos o vencimento"
+                    f"NF {purchase.invoice_number or purchase.erp_entry_id} - pagamento em atraso; desconto não aplicável"
                     if lost_due_to_late_payment
                     else f"NF {purchase.invoice_number or purchase.erp_entry_id} - {purchase.supplier_name or rule.company_code}"
                 ),
@@ -422,6 +574,7 @@ def _base_item_payloads(db: Session, row: Reconciliation, rule: BonusRule):
                     "discount_matches_expected": raw_discount == expected,
                     "exact_native_chain": exact_chain,
                     "lost_due_to_late_payment": lost_due_to_late_payment,
+                    "contractual_expected_value": float(contractual_expected),
                     "late_payment_days": (
                         (documents[0].payment_date - documents[0].due_date).days
                         if lost_due_to_late_payment
@@ -467,14 +620,63 @@ def _base_item_payloads(db: Session, row: Reconciliation, rule: BonusRule):
 def _automatic_policy(rule: BonusRule, item_payload: dict, observed: Decimal) -> tuple[bool, str]:
     expected = money(item_payload["expected"])
     exact = abs(expected - observed) <= CENT_TOLERANCE
+    has_unassigned_ipiranga_portal_credit = (
+        rule.kind == "distributor_credit"
+        and rule.unit_code in {"003", "004"}
+        and rule.company_code == "IPIRANGA"
+        and any(
+            payload.get("source") == "unassigned_portal_credit"
+            for payload in item_payload["evidence"]
+        )
+    )
     counted = [payload for payload in item_payload["evidence"] if _evidence_amount(payload)[2]]
     source_values_are_exact = bool(counted) and all(
         _evidence_amount(payload)[0] == _evidence_amount(payload)[1]
         and _evidence_amount(payload)[1] > 0
         for payload in counted
     )
+    unique_unit_004_cycle = (
+        _is_unit_004_nf_cycle_rule(rule)
+        and exact
+        and bool(counted)
+        and all(
+            payload.get("source") == "IPIRANGA_PORTAL_CYCLE"
+            and payload.get("portal_cycle_match_status") == "unique_contiguous_nf_cycle"
+            and payload.get("portal_cycle_exact") is True
+            for payload in counted
+        )
+    )
+    direct_unit_004_portal_usage = (
+        is_unit_004_portal_credit_rule(rule)
+        and exact
+        and bool(counted)
+        and all(
+            payload.get("source") == "IPIRANGA_PORTAL_USAGE"
+            and payload.get("portal_usage_confirmed") is True
+            for payload in counted
+        )
+    )
+    if item_payload.get("details", {}).get("lost_due_to_late_payment"):
+        days = int(item_payload["details"].get("late_payment_days") or 0)
+        return False, f"Título liquidado {days} dia(s) após o vencimento; desconto contratual não aplicável."
     if expected <= 0:
         return False, "O valor identificado não fecha exatamente o valor esperado deste item."
+    if unique_unit_004_cycle:
+        return (
+            True,
+            "Crédito Ipiranga confirmado por ciclo único de NFs: a sequência cronológica "
+            "fecha a litragem e o valor do crédito do portal a R$ 0,07/L.",
+        )
+    if direct_unit_004_portal_usage:
+        return (
+            True,
+            "Crédito Ipiranga confirmado no extrato do portal, com NF utilizada, data e valor do crédito declarados pela distribuidora.",
+        )
+    if has_unassigned_ipiranga_portal_credit:
+        return (
+            False,
+            "Credito listado no portal Ipiranga, mas sem competencia explicita; aguarda a identificacao da distribuidora e nao e apropriado automaticamente.",
+        )
     if not exact:
         return False, "O valor identificado não fecha exatamente o valor esperado deste item."
     if not counted:
@@ -542,7 +744,7 @@ def _automatic_policy(rule: BonusRule, item_payload: dict, observed: Decimal) ->
         # bonificação, e por isso não fecha a competência dessa unidade.
         allowed = (
             {"IPIRANGA_PORTAL"}
-            if rule.unit_code == "003" and rule.company_code == "IPIRANGA"
+            if rule.unit_code in {"003", "004"} and rule.company_code == "IPIRANGA"
             else {"MDCMP", "IPIRANGA_PORTAL"}
         )
         # A bonificação em crédito pode ser usada de forma fracionada em mais
@@ -560,8 +762,8 @@ def _automatic_policy(rule: BonusRule, item_payload: dict, observed: Decimal) ->
                 True,
                 "Crédito utilizado por valor exato: os valores vinculados a títulos/notas somam a bonificação esperada da competência.",
             )
-        if rule.unit_code == "003" and rule.company_code == "IPIRANGA":
-            return False, "A unidade 003 exige extrato Ipiranga como prova do crédito postecipado."
+        if rule.unit_code in {"003", "004"} and rule.company_code == "IPIRANGA":
+            return False, "A unidade exige extrato Ipiranga como prova do crédito postecipado."
         return True, "Conciliação concluída: os créditos utilizados vinculados fecham integralmente o valor esperado."
     if rule.kind == "s10_excess_credit":
         if source_values_are_exact and all(payload.get("source") == "MDCMP" for payload in counted):
@@ -579,10 +781,24 @@ def _item_status(
     today: date,
     automatic: bool,
 ) -> str:
+    if payload.get("details", {}).get("lost_due_to_late_payment"):
+        return "late_payment"
     if expected <= 0 and observed <= 0:
         return "not_applicable"
     if automatic:
         return "auto_confirmed"
+    if (
+        rule.kind == "distributor_credit"
+        and rule.unit_code in {"003", "004"}
+        and rule.company_code == "IPIRANGA"
+        and any(
+            item.get("source") == "unassigned_portal_credit"
+            for item in payload.get("evidence", [])
+        )
+    ):
+        # The portal proves a granted credit but does not name its competence.
+        # This is an external-source pending state, not an overdue collection.
+        return "pending"
     if rule.kind == "invoice_discount" and payload.get("item_type") == "invoice":
         details = payload.get("details") or {}
         document_count = int(details.get("document_count") or 0)
@@ -591,10 +807,11 @@ def _item_status(
         if document_count != 1:
             return "data_gap"
         if not paid:
-            if details.get("portal_credit_issued"):
-                return "pending"
-            title_due = _date(details.get("title_due_date")) or due
-            return "overdue" if title_due and title_due < today else "pending"
+            # A title due date is not proof that the boleto was paid.  Until
+            # its settlement reaches the ERP, the discount may already have
+            # been granted in the distributor portal or may still be pending.
+            # It must remain a follow-up item, never a financial charge.
+            return "pending"
         if int(details.get("discount_count") or 0) == 0 or raw_discount != expected:
             return "divergent"
         if not details.get("exact_native_chain"):
@@ -602,7 +819,7 @@ def _item_status(
         return "data_gap"
     if (
         rule.kind == "distributor_credit"
-        and rule.unit_code == "003"
+        and rule.unit_code in {"003", "004"}
         and rule.company_code == "IPIRANGA"
         and not any(item.get("source") == "IPIRANGA_PORTAL" for item in payload.get("evidence", []))
     ):
@@ -708,7 +925,7 @@ def _upsert_item(db: Session, row: Reconciliation, rule: BonusRule, payload: dic
             item.review_status = "pending"
     item.confidence = (
         "direct"
-        if automatic or item.status == "divergent"
+        if automatic or item.status in {"divergent", "late_payment"}
         else "probable"
         if observed > 0
         else "none"

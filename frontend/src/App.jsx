@@ -61,6 +61,12 @@ import {
   YAxis,
 } from "recharts";
 import { get, patch, post, remove, upload } from "./api";
+import { downloadExcel } from "./excel";
+import {
+  informationRequests,
+  reconciliationAuditActionLabel,
+  reviewActionAvailability,
+} from "./reconciliation-actions";
 import {
   Badge, Empty, Kpi, Loading, PageHeader, Progress, SyncWarning, d,
   freightIssueLabels, isoMonth, money, month, n, rateMoney, ruleLabels,
@@ -201,10 +207,26 @@ function rollingMonthOptions(total = 30) {
 
 function MultiSelect({ label, options, value = [], onChange, placeholder = "Todos" }) {
   const [open, setOpen] = useState(false);
+  const rootRef = useRef(null);
   const selected = options.filter((option) => value.includes(option.value));
   const summary = selected.length === 0 ? placeholder : selected.length === 1 ? selected[0].label : `${selected.length} selecionados`;
   const toggle = (optionValue) => onChange(value.includes(optionValue) ? value.filter((item) => item !== optionValue) : [...value, optionValue]);
-  return <div className={`multi-select ${open ? "open" : ""}`}>
+  useEffect(() => {
+    if (!open) return undefined;
+    const closeWhenOutside = (event) => {
+      if (!rootRef.current?.contains(event.target)) setOpen(false);
+    };
+    const closeOnEscape = (event) => {
+      if (event.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("pointerdown", closeWhenOutside);
+    document.addEventListener("keydown", closeOnEscape);
+    return () => {
+      document.removeEventListener("pointerdown", closeWhenOutside);
+      document.removeEventListener("keydown", closeOnEscape);
+    };
+  }, [open]);
+  return <div ref={rootRef} className={`multi-select ${open ? "open" : ""}`}>
     {label && <span className="multi-select-label">{label}</span>}
     <button type="button" className="multi-select-trigger" onClick={() => setOpen((current) => !current)} aria-expanded={open}><span>{summary}</span><ChevronRight /></button>
     {open && <div className="multi-select-options" role="listbox" aria-label={label}>
@@ -212,6 +234,32 @@ function MultiSelect({ label, options, value = [], onChange, placeholder = "Todo
       {options.map((option) => <label key={option.value} className="multi-select-option"><input type="checkbox" checked={value.includes(option.value)} onChange={() => toggle(option.value)} /><span>{option.label}</span></label>)}
     </div>}
   </div>;
+}
+
+function ExcelExportButton({ filename, sheetName, columns, rows, getRows, disabled = false, onError }) {
+  const [exporting, setExporting] = useState(false);
+  async function exportRows() {
+    setExporting(true);
+    try {
+      const allRows = getRows ? await getRows() : rows;
+      downloadExcel({ filename, sheetName, columns, rows: allRows || [] });
+    } catch (error) {
+      const message = error.message || "Falha ao exportar a planilha.";
+      if (onError) onError(message);
+      else window.alert(message);
+    } finally {
+      setExporting(false);
+    }
+  }
+  return <button type="button" className="secondary table-export" disabled={disabled || exporting} onClick={exportRows}><Download /> {exporting ? "Exportando..." : "Exportar Excel"}</button>;
+}
+
+function sumRows(rows, field) {
+  return (rows || []).reduce((total, row) => total + Number(row?.[field] || 0), 0);
+}
+
+function LoadFailure({ message, onRetry }) {
+  return <div className="form-error load-failure" role="alert"><span>{message || "Não foi possível carregar os dados."}</span><button type="button" className="secondary" onClick={onRetry}><RefreshCw /> Tentar novamente</button></div>;
 }
 
 function SidebarModule({ title, Icon, items, onNavigate, initiallyOpen = true }) {
@@ -228,8 +276,15 @@ function Layout({ user, onLogout, children }) {
     <div className="app-shell">
       <aside className={open ? "sidebar open" : "sidebar"}>
         <div className="sidebar-brand">
-          <img src="/logo-gbi.png" alt="GBI" />
-          <button onClick={() => setOpen(false)}>
+          <Link
+            className="sidebar-logo-link"
+            to="/"
+            aria-label="Ir para visão geral"
+            onClick={() => setOpen(false)}
+          >
+            <img src="/logo-gbi.png" alt="GBI" />
+          </Link>
+          <button aria-label="Fechar menu" onClick={() => setOpen(false)}>
             <X />
           </button>
         </div>
@@ -256,7 +311,7 @@ function Layout({ user, onLogout, children }) {
       )}
       <div className="main-area">
         <header className="topbar">
-          <button className="menu" onClick={() => setOpen(true)}>
+          <button className="menu" aria-label="Abrir menu" onClick={() => setOpen(true)}>
             <Menu />
           </button>
           <div>
@@ -276,7 +331,39 @@ function Layout({ user, onLogout, children }) {
   );
 }
 
-function BonusDetailsDrawer({ data, loading, onClose }) {
+const openDrawerTokens = [];
+let pageOverflowBeforeDrawer = "";
+
+function useDrawerBehavior(onClose) {
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+
+  useEffect(() => {
+    const token = Symbol("drawer");
+    if (openDrawerTokens.length === 0) {
+      pageOverflowBeforeDrawer = document.body.style.overflow;
+      document.body.style.overflow = "hidden";
+    }
+    openDrawerTokens.push(token);
+    const onKeyDown = (event) => {
+      if (event.key === "Escape" && openDrawerTokens.at(-1) === token) {
+        onCloseRef.current?.();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("keydown", onKeyDown);
+      const index = openDrawerTokens.indexOf(token);
+      if (index >= 0) openDrawerTokens.splice(index, 1);
+      if (openDrawerTokens.length === 0) {
+        document.body.style.overflow = pageOverflowBeforeDrawer;
+      }
+    };
+  }, []);
+}
+
+export function BonusDetailsDrawer({ data, loading, error, onRetry, onClose }) {
+  useDrawerBehavior(onClose);
   return (
     <div className="reconciliation-overlay" role="dialog" aria-modal="true" aria-label="Detalhamento da bonificação esperada">
       <button className="drawer-backdrop" onClick={onClose} aria-label="Fechar" />
@@ -290,7 +377,7 @@ function BonusDetailsDrawer({ data, loading, onClose }) {
           <button className="drawer-close" onClick={onClose} aria-label="Fechar"><X /></button>
         </header>
         <div className="drawer-body">
-          {loading || !data ? <Loading /> : <>
+          {error ? <LoadFailure message={error} onRetry={onRetry} /> : loading || !data ? <Loading /> : <>
             <section className="bonus-detail-totals">
               <div><span>Esperado</span><strong>{money(data.totals.expected_value)}</strong></div>
               <div><span>Identificado</span><strong>{money(data.totals.identified_value)}</strong></div>
@@ -327,7 +414,7 @@ function BonusDetailsDrawer({ data, loading, onClose }) {
   );
 }
 
-function Dashboard() {
+export function Dashboard() {
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
   const [selectedMonth, setSelectedMonth] = useState(isoMonth());
@@ -336,22 +423,32 @@ function Dashboard() {
   const [bonusDetails, setBonusDetails] = useState(null);
   const [showBonusDetails, setShowBonusDetails] = useState(false);
   const [bonusLoading, setBonusLoading] = useState(false);
+  const [bonusError, setBonusError] = useState("");
   useEffect(() => {
     get(`/dashboard?reference_month=${selectedMonth}-01`)
       .then(setData)
       .catch((e) => setError(e.message));
   }, [selectedMonth]);
-  useEffect(() => {
+  const loadBonusDetails = async () => {
     const query = new URLSearchParams({ reference_month: `${selectedMonth}-01` });
     const allowedUnits = (data?.units || [])
       .filter((unit) => (!selectedUnits.length || selectedUnits.includes(unit.code)) && (!selectedBrands.length || selectedBrands.includes(unit.brand)))
       .map((unit) => unit.code);
     allowedUnits.forEach((code) => query.append("unit", code));
     setBonusLoading(true);
-    get(`/dashboard/bonus-details?${query}`)
-      .then(setBonusDetails)
-      .catch(() => setBonusDetails(null))
-      .finally(() => setBonusLoading(false));
+    setBonusError("");
+    try {
+      setBonusDetails(await get(`/dashboard/bonus-details?${query}`));
+    } catch (loadError) {
+      setBonusDetails(null);
+      setBonusError(loadError.message);
+    } finally {
+      setBonusLoading(false);
+    }
+  };
+  useEffect(() => {
+    if (!data) return;
+    loadBonusDetails();
   }, [data, selectedMonth, selectedUnits, selectedBrands]);
   if (!data && !error) return <Loading />;
   const unitByCode = Object.fromEntries((data?.units || []).map((unit) => [unit.code, unit]));
@@ -539,18 +636,31 @@ function Dashboard() {
               ))}
             </div>
           </section>
-          {showBonusDetails && <BonusDetailsDrawer data={bonusDetails} loading={bonusLoading} onClose={() => setShowBonusDetails(false)} />}
+          {showBonusDetails && <BonusDetailsDrawer data={bonusDetails} loading={bonusLoading} error={bonusError} onRetry={loadBonusDetails} onClose={() => setShowBonusDetails(false)} />}
         </>
       )}
     </>
   );
 }
 
-function Contracts() {
+export function Contracts() {
   const [rows, setRows] = useState(null);
   const [search, setSearch] = useState("");
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const load = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setRows(await get("/units"));
+    } catch (loadError) {
+      setError(loadError.message);
+    } finally {
+      setLoading(false);
+    }
+  };
   useEffect(() => {
-    get("/units").then(setRows);
+    load();
   }, []);
   const filtered = useMemo(
     () =>
@@ -561,7 +671,8 @@ function Contracts() {
       ),
     [rows, search],
   );
-  if (!rows) return <Loading />;
+  if (loading) return <Loading />;
+  if (error) return <LoadFailure message={error} onRetry={load} />;
   return (
     <>
       <PageHeader
@@ -653,13 +764,28 @@ function Contracts() {
   );
 }
 
-function UnitDetail() {
+export function UnitDetail() {
   const { code } = useParams();
   const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const load = async () => {
+    setLoading(true);
+    setError("");
+    try {
+      setData(await get(`/units/${code}`));
+    } catch (loadError) {
+      setError(loadError.message);
+    } finally {
+      setLoading(false);
+    }
+  };
   useEffect(() => {
-    get(`/units/${code}`).then(setData);
+    setData(null);
+    load();
   }, [code]);
-  if (!data) return <Loading />;
+  if (loading) return <Loading />;
+  if (error) return <LoadFailure message={error} onRetry={load} />;
   const c = data.contract;
   const trendSeries = (data.series || []).map((row, index, rows) => {
     const window = rows.slice(Math.max(0, index - 2), index + 1);
@@ -815,7 +941,8 @@ function UnitDetail() {
   );
 }
 
-function PurchaseDetail({ entryId, onClose }) {
+export function PurchaseDetail({ entryId, onClose }) {
+  useDrawerBehavior(onClose);
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -829,14 +956,14 @@ function PurchaseDetail({ entryId, onClose }) {
       <div className="drawer-body">{error && <div className="form-error">{error}</div>}{!data && !error ? <Loading /> : data && <>
         <section className="purchase-hero"><div><span>Emissão</span><strong>{d(data.invoice_issue_date || data.purchase_date)}</strong></div><div><span>Litros</span><strong>{n(data.total_liters, 3)} L</strong></div><div><span>S10</span><strong>{n(data.s10_liters, 3)} L</strong></div><div><span>Valor líquido</span><strong>{money(data.net_value)}</strong></div></section>
         <section className="detail-section"><div className="section-title"><FileText /><div><h3>Dados da nota</h3><p>Registro sincronizado do ERP, sem alteração na origem.</p></div></div><div className="freight-facts"><div><span>Chave de acesso</span><strong>{data.access_key || "Não informada"}</strong></div><div><span>Série</span><strong>{data.invoice_series || "—"}</strong></div><div><span>CNPJ fornecedor</span><strong>{data.supplier_cnpj || "Não informado"}</strong></div><div><span>Companhia mapeada</span><strong>{data.company_code || "Fora do contrato"}</strong></div><div><span>Valor bruto</span><strong>{money(data.gross_value)}</strong></div><div><span>Atualização no ERP</span><strong>{d(data.erp_updated_at)}</strong></div></div></section>
-        <section className="detail-section"><div className="section-title"><Fuel /><div><h3>Itens da nota</h3><p>Quantidade, produto e valor de cada item adquirido.</p></div></div><div className="table-scroll compact-table"><table><thead><tr><th>Seq.</th><th>Código</th><th>Descrição</th><th className="right">Quantidade</th><th className="right">Vlr. unitário</th><th className="right">Total</th></tr></thead><tbody>{data.items.map((item) => <tr key={item.id}><td>{item.sequence}</td><td>{item.item_code}</td><td>{item.description}</td><td className="right">{n(item.quantity, 3)} {item.unit}</td><td className="right">{money(item.unit_value)}</td><td className="right">{money(item.total_value)}</td></tr>)}</tbody></table></div></section>
+        <section className="detail-section"><div className="section-title section-title-wrap"><div className="section-title-main"><Fuel /><div><h3>Itens da nota</h3><p>Quantidade, produto e valor de cada item adquirido.</p></div></div><ExcelExportButton filename={`nf-${data.invoice_number || entryId}-itens`} sheetName="Itens da nota" rows={data.items} columns={[{ label: "Sequência", value: (item) => item.sequence }, { label: "Código", value: (item) => item.item_code || "" }, { label: "Descrição", value: (item) => item.description || "" }, { label: "Quantidade", value: (item) => Number(item.quantity || 0) }, { label: "Unidade", value: (item) => item.unit || "" }, { label: "Valor unitário", value: (item) => Number(item.unit_value || 0) }, { label: "Total", value: (item) => Number(item.total_value || 0) }]} /></div><div className="table-scroll compact-table"><table><thead><tr><th>Seq.</th><th>Código</th><th>Descrição</th><th className="right">Quantidade</th><th className="right">Vlr. unitário</th><th className="right">Total</th></tr></thead><tbody>{data.items.map((item) => <tr key={item.id}><td>{item.sequence}</td><td>{item.item_code}</td><td>{item.description}</td><td className="right">{n(item.quantity, 3)} {item.unit}</td><td className="right">{money(item.unit_value)}</td><td className="right">{money(item.total_value)}</td></tr>)}</tbody><tfoot><tr><th colSpan="3">Total</th><th className="right">{n(sumRows(data.items, "quantity"), 3)}</th><th /><th className="right">{money(sumRows(data.items, "total_value"))}</th></tr></tfoot></table></div></section>
         <section className="detail-section"><div className="section-title"><CreditCard /><div><h3>Títulos, boletos e baixas</h3><p>Vínculos financeiros encontrados para esta NF.</p></div></div>{data.payables.length ? <div className="purchase-payables">{data.payables.map((title) => <article key={title.id}><header><div><strong>{title.document_id}/{title.sequence}</strong><span>Vence {d(title.due_date)} • {title.payment_date ? `pago em ${d(title.payment_date)}` : "aguardando baixa"}</span></div><div><strong>{money(title.document_value)}</strong><span>Descontos {money(title.other_discount)}</span></div></header>{latePaymentDays(title) > 0 && <LatePaymentWarning title={title} />}{title.movements.length ? <div className="purchase-movements">{title.movements.map((movement) => <div key={movement.erp_key}><span>{d(movement.movement_date)}</span><strong>{money(movement.amount)}</strong><small>{movement.movement_type || "Movimento financeiro"}{movement.payment_method ? ` • ${movement.payment_method}` : ""}{movement.notes ? ` • ${movement.notes}` : ""}</small></div>)}</div> : <small className="muted">Nenhum movimento financeiro vinculado ao título.</small>}</article>)}</div> : <Empty text="Nenhum título financeiro localizado para esta nota." />}</section>
       </>}</div>
     </section>
   </div>;
 }
 
-function Purchases() {
+export function Purchases() {
   const params = new URLSearchParams(location.search);
   const initialUnit = params.get("unit");
   const [units, setUnits] = useState([]);
@@ -844,34 +971,73 @@ function Purchases() {
   const [company, setCompany] = useState([]);
   const [reference, setReference] = useState([]);
   const [search, setSearch] = useState("");
+  const [appliedSearch, setAppliedSearch] = useState("");
   const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
   const [sortBy, setSortBy] = useState("purchase_date");
   const [sortDir, setSortDir] = useState("desc");
+  const [page, setPage] = useState(1);
   const [selected, setSelected] = useState(null);
-  const load = () => {
-    const query = new URLSearchParams({ sort_by: sortBy, sort_dir: sortDir, page_size: "100" });
+  const requestVersion = useRef(0);
+  const buildQuery = (requestedPage = 1, pageSize = 50) => {
+    const query = new URLSearchParams({ page: String(requestedPage), page_size: String(pageSize), sort_by: sortBy, sort_dir: sortDir });
     unit.forEach((value) => query.append("unit", value));
     company.forEach((value) => query.append("company", value));
     reference.forEach((value) => query.append("reference_month", value));
-    if (search) query.set("search", search);
-    return get(`/purchases?${query}`).then(setData);
+    if (appliedSearch) query.set("search", appliedSearch);
+    return query;
+  };
+  const load = async (requestedPage = page) => {
+    const currentRequest = ++requestVersion.current;
+    setLoading(true);
+    setError("");
+    try {
+      const result = await get(`/purchases?${buildQuery(requestedPage)}`);
+      if (currentRequest === requestVersion.current) setData(result);
+      return result;
+    } catch (loadError) {
+      if (currentRequest === requestVersion.current) setError(loadError.message);
+      return null;
+    } finally {
+      if (currentRequest === requestVersion.current) setLoading(false);
+    }
   };
   useEffect(() => { get("/units").then(setUnits).catch(() => {}); }, []);
-  useEffect(() => { load(); }, [unit, company, reference, sortBy, sortDir]);
+  useEffect(() => { load(page); }, [page, unit, company, reference, sortBy, sortDir, appliedSearch]);
   const monthOptions = rollingMonthOptions();
   const unitOptions = units.map((row) => ({ value: row.code, label: `${row.code} • ${unitName(row)}` }));
   const companyOptions = [{ value: "IPIRANGA", label: "Ipiranga" }, { value: "BR", label: "BR / Vibra" }, { value: "SHELL", label: "Shell / Raízen" }, { value: "TEXACO", label: "Texaco" }];
-  const changeSort = (field) => { if (field === sortBy) setSortDir((value) => value === "asc" ? "desc" : "asc"); else { setSortBy(field); setSortDir("asc"); } };
+  const updateFilter = (setter) => (values) => { setPage(1); setter(values); };
+  const changeSort = (field) => {
+    setPage(1);
+    if (field === sortBy) setSortDir((value) => value === "asc" ? "desc" : "asc");
+    else { setSortBy(field); setSortDir("asc"); }
+  };
+  const applySearch = () => {
+    setPage(1);
+    setAppliedSearch(search.trim());
+  };
+  const exportRows = async () => {
+    const first = await get(`/purchases?${buildQuery(1, 200)}`);
+    const rows = [...first.items];
+    for (let nextPage = 2; nextPage <= first.pages; nextPage += 1) {
+      const response = await get(`/purchases?${buildQuery(nextPage, 200)}`);
+      rows.push(...response.items);
+    }
+    return rows;
+  };
   const sortLabel = (field, label) => <button type="button" className="table-sort" onClick={() => changeSort(field)}>{label}{sortBy === field ? (sortDir === "asc" ? " ↑" : " ↓") : ""}</button>;
   return <>
     <PageHeader eyebrow="ORIGEM ERP" title="Compras e notas fiscais" subtitle="Notas, itens, títulos e baixas sincronizados em modo somente leitura." />
-    <div className="filters purchase-filters"><MultiSelect label="Unidades" options={unitOptions} value={unit} onChange={setUnit} /><MultiSelect label="Companhias" options={companyOptions} value={company} onChange={setCompany} /><MultiSelect label="Competências" options={monthOptions} value={reference} onChange={setReference} /><label className="grow">Nota, fornecedor, CNPJ ou chave<div className="input-icon"><Search /><input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && load()} placeholder="Digite para buscar" /></div></label><button className="primary" onClick={load}><Search /> Buscar</button></div>
-    {!data ? <Loading /> : data.items.length ? <div className="panel table-panel"><div className="table-scroll"><table><thead><tr><th>{sortLabel("purchase_date", "Data")}</th><th>{sortLabel("unit_code", "Unidade")}</th><th>{sortLabel("invoice_number", "Nota")}</th><th>{sortLabel("supplier_name", "Fornecedor")}</th><th>CNPJ</th><th>{sortLabel("company_code", "Companhia")}</th><th className="right">{sortLabel("total_liters", "Litros")}</th><th className="right">{sortLabel("s10_liters", "S10")}</th><th className="right">{sortLabel("net_value", "Valor líquido")}</th><th /></tr></thead><tbody>{data.items.map((row) => <tr key={row.erp_entry_id} className="table-clickable" onClick={() => setSelected(row.erp_entry_id)}><td>{d(row.purchase_date)}</td><td><span className="unit-chip">{row.unit_code}</span></td><td><strong>{row.invoice_number || "—"}</strong></td><td><strong>{row.supplier_name || "Não informado"}</strong></td><td>{row.supplier_cnpj || "—"}</td><td>{row.mapped ? <Badge status="confirmed">{row.company_code}</Badge> : <Badge status="pending">Fora do contrato</Badge>}</td><td className="right">{n(row.total_liters, 3)}</td><td className="right">{n(row.s10_liters, 3)}</td><td className="right">{money(row.net_value)}</td><td><button className="icon-button" onClick={(event) => { event.stopPropagation(); setSelected(row.erp_entry_id); }} aria-label="Abrir nota"><Eye /></button></td></tr>)}</tbody></table></div><div className="table-footer">{data.total} registros • clique em uma nota para abrir seus itens, títulos e baixas.</div></div> : <Empty />}
+    <div className="filters purchase-filters"><MultiSelect label="Unidades" options={unitOptions} value={unit} onChange={updateFilter(setUnit)} /><MultiSelect label="Companhias" options={companyOptions} value={company} onChange={updateFilter(setCompany)} /><MultiSelect label="Competências" options={monthOptions} value={reference} onChange={updateFilter(setReference)} /><label className="grow">Nota, fornecedor, CNPJ ou chave<div className="input-icon"><Search /><input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(e) => e.key === "Enter" && applySearch()} placeholder="Digite para buscar" /></div></label><button className="primary" onClick={applySearch}><Search /> Buscar</button></div>
+    {error ? <LoadFailure message={error} onRetry={() => load(page)} /> : loading || !data ? <Loading /> : data.items.length ? <div className="panel table-panel"><div className="table-toolbar"><span>{data.total} registros encontrados</span><ExcelExportButton filename="compras-e-notas" sheetName="Compras" getRows={exportRows} columns={[{ label: "Data", value: (row) => d(row.purchase_date) }, { label: "Unidade", value: (row) => row.unit_code }, { label: "Nota", value: (row) => row.invoice_number || "" }, { label: "Fornecedor", value: (row) => row.supplier_name || "" }, { label: "CNPJ", value: (row) => row.supplier_cnpj || "" }, { label: "Companhia", value: (row) => row.company_code || "Fora do contrato" }, { label: "Litros", value: (row) => Number(row.total_liters || 0) }, { label: "Valor líquido", value: (row) => Number(row.net_value || 0) }, { label: "Chave de acesso", value: (row) => row.access_key || "" }]} /></div><div className="table-scroll"><table><thead><tr><th>{sortLabel("purchase_date", "Data")}</th><th>{sortLabel("unit_code", "Unidade")}</th><th>{sortLabel("invoice_number", "Nota")}</th><th>{sortLabel("supplier_name", "Fornecedor")}</th><th>CNPJ</th><th>{sortLabel("company_code", "Companhia")}</th><th className="right">{sortLabel("total_liters", "Litros")}</th><th className="right">{sortLabel("net_value", "Valor líquido")}</th><th /></tr></thead><tbody>{data.items.map((row) => <tr key={row.erp_entry_id} className="table-clickable" onClick={() => setSelected(row.erp_entry_id)}><td>{d(row.purchase_date)}</td><td><span className="unit-chip">{row.unit_code}</span></td><td><strong>{row.invoice_number || "—"}</strong></td><td><strong>{row.supplier_name || "Não informado"}</strong></td><td>{row.supplier_cnpj || "—"}</td><td>{row.mapped ? <Badge status="confirmed">{row.company_code}</Badge> : <Badge status="pending">Fora do contrato</Badge>}</td><td className="right">{n(row.total_liters, 3)}</td><td className="right">{money(row.net_value)}</td><td><button className="icon-button" onClick={(event) => { event.stopPropagation(); setSelected(row.erp_entry_id); }} aria-label="Abrir nota"><Eye /></button></td></tr>)}</tbody><tfoot><tr><th colSpan="6">Total desta página</th><th className="right">{n(sumRows(data.items, "total_liters"), 3)} L</th><th className="right">{money(sumRows(data.items, "net_value"))}</th><th /></tr></tfoot></table></div><div className="table-footer pagination-footer"><span>{data.total} registros • clique em uma nota para abrir seus itens, títulos e baixas.</span><div className="pagination-actions"><button className="secondary" type="button" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Anterior</button><span>Página {data.page} de {Math.max(data.pages, 1)}</span><button className="secondary" type="button" disabled={page >= data.pages} onClick={() => setPage((value) => value + 1)}>Próxima</button></div></div></div> : <Empty />}
     {selected && <PurchaseDetail entryId={selected} onClose={() => setSelected(null)} />}
   </>;
 }
 
 function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
+  useDrawerBehavior(onClose);
   const [detail, setDetail] = useState(null);
   const [notes, setNotes] = useState("");
   const [error, setError] = useState("");
@@ -914,7 +1080,7 @@ function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
     ? detail.invoices.filter((invoice) => invoice.candidate)
     : [];
   return (
-    <div className="reconciliation-overlay">
+    <div className="reconciliation-overlay" role="dialog" aria-modal="true" aria-label="Conferência documental do frete">
       <button className="drawer-backdrop" onClick={onClose} aria-label="Fechar" />
       <section className="reconciliation-drawer freight-drawer">
         <header className="drawer-header">
@@ -973,7 +1139,7 @@ function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
                         <small className="freight-key">Referência original: {invoice.reference_invoice_number ? `NF ${invoice.reference_invoice_number}` : "NF sem número"} • {invoice.reference_issue_date ? d(invoice.reference_issue_date) : "data ausente"} • chave {invoice.reference_access_key || "ausente"}</small>
                         {purchase && <>
                           <div className="freight-invoice-summary"><span>Unidade {purchase.unit_code}</span><span>{d(purchase.issue_date)}</span><strong>{n(purchase.total_liters, 3)} L</strong></div>
-                          <div className="table-scroll compact-table"><table><thead><tr><th>Item</th><th>Descrição</th><th className="right">Quantidade</th><th className="right">Valor</th></tr></thead><tbody>{purchase.items.map((item, index) => <tr key={`${purchase.erp_entry_id}-${index}`}><td>{item.item_code}</td><td>{item.description}</td><td className="right">{n(item.quantity, 3)} {item.unit}</td><td className="right">{money(item.total_value)}</td></tr>)}</tbody></table></div>
+                          <div className="table-toolbar compact-table-toolbar"><span>Itens da NF {purchase.invoice_number}</span><ExcelExportButton filename={`frete-nf-${purchase.invoice_number || purchase.erp_entry_id}-itens`} sheetName="Itens NF" rows={purchase.items} columns={[{ label: "Item", value: (item) => item.item_code || "" }, { label: "Descrição", value: (item) => item.description || "" }, { label: "Quantidade", value: (item) => Number(item.quantity || 0) }, { label: "Unidade", value: (item) => item.unit || "" }, { label: "Valor", value: (item) => Number(item.total_value || 0) }]} /></div><div className="table-scroll compact-table"><table><thead><tr><th>Item</th><th>Descrição</th><th className="right">Quantidade</th><th className="right">Valor</th></tr></thead><tbody>{purchase.items.map((item, index) => <tr key={`${purchase.erp_entry_id}-${index}`}><td>{item.item_code}</td><td>{item.description}</td><td className="right">{n(item.quantity, 3)} {item.unit}</td><td className="right">{money(item.total_value)}</td></tr>)}</tbody><tfoot><tr><th colSpan="2">Total</th><th className="right">{n(sumRows(purchase.items, "quantity"), 3)}</th><th className="right">{money(sumRows(purchase.items, "total_value"))}</th></tr></tfoot></table></div>
                         </>}
                       </article>
                     );
@@ -1013,6 +1179,7 @@ function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
 }
 
 function FreightMetricDetails({ metric, query, onClose, onOpen }) {
+  useDrawerBehavior(onClose);
   const [data, setData] = useState(null);
   const [error, setError] = useState("");
   useEffect(() => {
@@ -1072,6 +1239,22 @@ function Freights({ user }) {
   const unitOptions = units.map((row) => ({ value: row.code, label: `${row.code} • ${unitName(row)}` }));
   const statusOptions = ["correct", "overcharged", "undercharged", "document_mismatch", "unpriced", "payable_mismatch", "missing_payable"].map((key) => ({ value: key, label: statusMeta[key]?.[0] || key }));
   const detailQuery = useMemo(() => { const params = new URLSearchParams({ page_size: "100" }); competence.forEach((value) => params.append("competence", value)); unit.forEach((value) => params.append("unit", value)); status.forEach((value) => params.append("status", value)); if (carrier) params.set("carrier", carrier); if (search) params.set("search", search); return params.toString(); }, [competence, unit, status, carrier, search]);
+  const exportRows = async () => {
+    const params = new URLSearchParams({ page: "1", page_size: "200" });
+    competence.forEach((value) => params.append("competence", value));
+    unit.forEach((value) => params.append("unit", value));
+    status.forEach((value) => params.append("status", value));
+    if (carrier) params.set("carrier", carrier);
+    if (search) params.set("search", search);
+    const first = await get(`/freights?${params}`);
+    const rows = [...first.items];
+    for (let nextPage = 2; nextPage <= first.pages; nextPage += 1) {
+      params.set("page", String(nextPage));
+      const response = await get(`/freights?${params}`);
+      rows.push(...response.items);
+    }
+    return rows;
+  };
   return (
     <>
       <PageHeader eyebrow="VERIFICAÇÃO INDEPENDENTE" title="Conciliação de fretes" subtitle="Compara CT-e, NF-es de combustível, tarifa contratada e contas a pagar sem escrever no ERP." />
@@ -1094,7 +1277,8 @@ function Freights({ user }) {
           <Kpi icon={AlertTriangle} label="Pendências" value={n(summary.pending)} detail="Exigem revisão documental ou financeira • clique para detalhar" tone="orange" onClick={() => setSelectedMetric("pending")} />
         </div>
         {data.items.length ? <div className="panel table-panel freight-table">
-          <div className="table-scroll"><table><thead><tr><th>Documento</th><th>Unidade</th><th>Transportador</th><th className="right">Litros</th><th>Valores</th><th>Conferência</th><th>Situação</th></tr></thead><tbody>{data.items.map((row) => <tr key={row.id} onDoubleClick={() => setSelected(row.id)}><td data-label="Documento"><strong>CT-e {row.cte_number}</strong><small className="table-subline">{d(row.reference_date || row.issue_date)} • {row.source_kind === "purchase_entry" ? `Entrada ${row.source_entry_id}` : `Cd_CTe ${row.erp_cte_id}`}</small></td><td data-label="Unidade"><span className="unit-chip">{row.unit_code}</span></td><td data-label="Transportador"><strong>{row.carrier_name}</strong><small className="table-subline">{row.carrier_cnpj}</small></td><td data-label="Litros" className="right freight-liters">{n(row.matched_liters)} L</td><td data-label="Valores" className="freight-values"><span><small>Esperado</small><strong>{row.comparison_available ? money(row.expected_value) : "—"}</strong></span><span><small>Cobrado</small><strong>{money(row.charged_value)}</strong></span></td><td data-label="Conferência" className="freight-comparison"><strong className={row.comparison_available && row.difference_value > 0 ? "negative" : ""}>{row.comparison_available ? `Diferença ${money(row.difference_value)}` : "Sem base de comparação"}</strong><small className="table-subline">{row.comparison_available ? "Litros e tarifa comprovados." : row.comparison_reason}</small></td><td data-label="Situação" className="freight-status-cell"><Badge status={row.primary_status} /><button className="icon-button" onClick={() => setSelected(row.id)} aria-label="Abrir detalhe"><Eye /></button></td></tr>)}</tbody></table></div>
+          <div className="table-toolbar"><span>{data.total} CT-es encontrados</span><ExcelExportButton filename="conciliacao-de-fretes" sheetName="Fretes" getRows={exportRows} onError={setError} columns={[{ label: "Competência", value: (row) => d(row.reference_date || row.issue_date) }, { label: "CT-e", value: (row) => row.cte_number || "" }, { label: "Unidade", value: (row) => row.unit_code || "" }, { label: "Transportador", value: (row) => row.carrier_name || "" }, { label: "CNPJ transportador", value: (row) => row.carrier_cnpj || "" }, { label: "Litros", value: (row) => Number(row.matched_liters || 0) }, { label: "Frete esperado", value: (row) => row.comparison_available ? Number(row.expected_value || 0) : "" }, { label: "Frete cobrado", value: (row) => Number(row.charged_value || 0) }, { label: "Diferença", value: (row) => row.comparison_available ? Number(row.difference_value || 0) : "" }, { label: "Situação", value: (row) => statusMeta[row.primary_status]?.[0] || row.primary_status }]} /></div>
+          <div className="table-scroll"><table><thead><tr><th>Documento</th><th>Unidade</th><th>Transportador</th><th className="right">Litros</th><th>Valores</th><th>Conferência</th><th>Situação</th></tr></thead><tbody>{data.items.map((row) => <tr key={row.id} onDoubleClick={() => setSelected(row.id)}><td data-label="Documento"><strong>CT-e {row.cte_number}</strong><small className="table-subline">{d(row.reference_date || row.issue_date)} • {row.source_kind === "purchase_entry" ? `Entrada ${row.source_entry_id}` : `Cd_CTe ${row.erp_cte_id}`}</small></td><td data-label="Unidade"><span className="unit-chip">{row.unit_code}</span></td><td data-label="Transportador"><strong>{row.carrier_name}</strong><small className="table-subline">{row.carrier_cnpj}</small></td><td data-label="Litros" className="right freight-liters">{n(row.matched_liters)} L</td><td data-label="Valores" className="freight-values"><span><small>Esperado</small><strong>{row.comparison_available ? money(row.expected_value) : "—"}</strong></span><span><small>Cobrado</small><strong>{money(row.charged_value)}</strong></span></td><td data-label="Conferência" className="freight-comparison"><strong className={row.comparison_available && row.difference_value > 0 ? "negative" : ""}>{row.comparison_available ? `Diferença ${money(row.difference_value)}` : "Sem base de comparação"}</strong><small className="table-subline">{row.comparison_available ? "Litros e tarifa comprovados." : row.comparison_reason}</small></td><td data-label="Situação" className="freight-status-cell"><Badge status={row.primary_status} /><button className="icon-button" onClick={() => setSelected(row.id)} aria-label="Abrir detalhe"><Eye /></button></td></tr>)}</tbody><tfoot><tr><th colSpan="3">Total desta página</th><th className="right">{n(sumRows(data.items, "matched_liters"), 3)} L</th><th className="freight-values"><span><small>Esperado</small><strong>{money(data.items.filter((row) => row.comparison_available).reduce((total, row) => total + Number(row.expected_value || 0), 0))}</strong></span><span><small>Cobrado</small><strong>{money(sumRows(data.items, "charged_value"))}</strong></span></th><th className="freight-comparison"><strong>Diferença {money(data.items.filter((row) => row.comparison_available).reduce((total, row) => total + Number(row.difference_value || 0), 0))}</strong></th><th /></tr></tfoot></table></div>
           <div className="table-footer pagination-footer">
             <span>{data.total} registros ativos na competência</span>
             <div className="pagination-actions">
@@ -1113,6 +1297,7 @@ function Freights({ user }) {
 
 const chainStatus = {
   discount_exact: ["Desconto exato", "green"],
+  late_payment: ["Pago com atraso", "yellow"],
   discount_divergent: ["Desconto divergente", "red"],
   pending_payment: ["Aguardando pagamento", "gray"],
   data_gap: ["Lacuna na cadeia", "yellow"],
@@ -1128,6 +1313,7 @@ function MatchBadge({ value }) {
 }
 
 function ReconciliationDetail({ reconciliationId, user, onClose, onChanged }) {
+  useDrawerBehavior(onClose);
   const [detail, setDetail] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -1999,7 +2185,7 @@ function ExceptionQueue({ user, onOpen }) {
       setData(await get(`/reconciliations/exceptions?${query}`));
     } catch (err) {
       setError(err.message);
-      setData({ items: [], summary: { open: 0, critical: 0, high: 0, in_review: 0, value_at_risk: 0, types: {} } });
+      setData(null);
     }
   };
   useEffect(() => {
@@ -2030,7 +2216,7 @@ function ExceptionQueue({ user, onOpen }) {
   }
   return (
     <>
-      {error && <div className="form-error">{error}</div>}
+      {error && <LoadFailure message={error} onRetry={load} />}
       {data?.summary && (
         <section className="kpi-grid exception-kpis">
           <Kpi icon={AlertTriangle} label="Exceções abertas" value={n(data.summary.open)} detail={`${n(data.summary.critical)} críticas`} tone="orange" />
@@ -2073,7 +2259,7 @@ function ExceptionQueue({ user, onOpen }) {
         </label>
       </div>
       {!data ? (
-        <Loading />
+        !error && <Loading />
       ) : data.items.length ? (
         <div className="exception-list">
           {data.items.map((item) => (
@@ -2124,16 +2310,19 @@ function ExceptionQueue({ user, onOpen }) {
 function ReconciliationCoverage() {
   const [coverage, setCoverage] = useState(null);
   const [error, setError] = useState("");
+  const load = async () => {
+    setError("");
+    try {
+      setCoverage(await get("/reconciliations/coverage"));
+    } catch (loadError) {
+      setCoverage(null);
+      setError(loadError.message);
+    }
+  };
   useEffect(() => {
-    let active = true;
-    get("/reconciliations/coverage")
-      .then((payload) => active && setCoverage(payload))
-      .catch((err) => active && setError(err.message));
-    return () => {
-      active = false;
-    };
+    load();
   }, []);
-  if (error) return <div className="form-error">{error}</div>;
+  if (error) return <LoadFailure message={error} onRetry={load} />;
   if (!coverage) return <Loading />;
   const summary = coverage.summary;
   const exceptionRisk = [
@@ -2143,6 +2332,7 @@ function ReconciliationCoverage() {
   ].reduce((total, key) => total + Number(summary.expected_values[key] || 0), 0);
   const causes = [
     ["exact_confirmed", "green", "Cadeia positiva completa"],
+    ["late_payment", "yellow", "Título pago após o vencimento; desconto não aplicável"],
     ["paid_without_discount", "red", "Baixa e pagamento comprovados, sem desconto D"],
     ["contract_discount_shortfall", "orange", "Desconto ligado ao título, mas abaixo da regra"],
     ["unclassified_excess_discount", "purple", "Crédito superior sem composição contratual identificável"],
@@ -2209,6 +2399,7 @@ function ReconciliationCoverage() {
         <article className="panel coverage-units">
           <div className="panel-head">
             <div><h3>Cobertura por unidade</h3><p>Confirmações, divergências e títulos abertos</p></div>
+            <ExcelExportButton filename="cobertura-por-unidade" sheetName="Cobertura" rows={coverage.units} columns={[{ label: "Unidade", value: (row) => row.unit_code }, { label: "Notas", value: (row) => Number(row.total_items || 0) }, { label: "Exatas", value: (row) => Number(row.exact_confirmed || 0) }, { label: "Exceções", value: (row) => Number(row.settled_exceptions || 0) }, { label: "Aguardando", value: (row) => Number(row.waiting_payment || 0) }, { label: "Encerradas (%)", value: (row) => Number(row.closed_rate || 0) }]} />
           </div>
           <div className="coverage-table-wrap">
             <table className="coverage-table">
@@ -2225,6 +2416,7 @@ function ReconciliationCoverage() {
                   </tr>
                 ))}
               </tbody>
+              <tfoot><tr><th>Total</th><th>{n(sumRows(coverage.units, "total_items"))}</th><th className="positive-text">{n(sumRows(coverage.units, "exact_confirmed"))}</th><th className="negative-text">{n(sumRows(coverage.units, "settled_exceptions"))}</th><th>{n(sumRows(coverage.units, "waiting_payment"))}</th><th><strong>{n(sumRows(coverage.units, "total_items") ? ((sumRows(coverage.units, "exact_confirmed") + sumRows(coverage.units, "settled_exceptions")) / sumRows(coverage.units, "total_items")) * 100 : 0, 2)}%</strong></th></tr></tfoot>
             </table>
           </div>
         </article>
@@ -2233,7 +2425,7 @@ function ReconciliationCoverage() {
   );
 }
 
-function LegacyReconciliations({ user }) {
+function CompetencesPanel({ user }) {
   const [data, setData] = useState(null);
   const [status, setStatus] = useState("");
   const [unit, setUnit] = useState("");
@@ -2241,7 +2433,6 @@ function LegacyReconciliations({ user }) {
   const [ruleKind, setRuleKind] = useState("");
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState(null);
-  const [view, setView] = useState("exceptions");
   const [error, setError] = useState("");
   const load = async () => {
     setError("");
@@ -2257,19 +2448,7 @@ function LegacyReconciliations({ user }) {
       setData(await get(`/reconciliations?${query}`));
     } catch (err) {
       setError(err.message);
-      setData({
-        items: [],
-        total: 0,
-        pages: 0,
-        summary: {
-          expected_value: 0,
-          observed_value: 0,
-          difference_value: 0,
-          status_counts: {},
-          review_required: 0,
-          manually_reviewed: 0,
-        },
-      });
+      setData(null);
     }
   };
   useEffect(() => {
@@ -2281,29 +2460,8 @@ function LegacyReconciliations({ user }) {
   };
   return (
     <>
-      <PageHeader
-        eyebrow="CONCILIAÇÃO"
-        title="Conferência de bonificações"
-        subtitle="Rastreabilidade completa da nota fiscal até o desconto, crédito ou depósito identificado."
-      />
-      <div className="reconciliation-tabs">
-        <button className={view === "exceptions" ? "active" : ""} onClick={() => setView("exceptions")}>
-          <AlertTriangle /> Central de exceções
-        </button>
-        <button className={view === "competencies" ? "active" : ""} onClick={() => setView("competencies")}>
-          <WalletCards /> Competências
-        </button>
-        <button className={view === "coverage" ? "active" : ""} onClick={() => setView("coverage")}>
-          <ShieldCheck /> Cobertura automática
-        </button>
-      </div>
-      {view === "exceptions" ? (
-        <ExceptionQueue user={user} onOpen={setSelected} />
-      ) : view === "coverage" ? (
-        <ReconciliationCoverage />
-      ) : (
-        <>
-      {error && <div className="form-error">{error}</div>}
+      <div className="panel-heading reconciliation-panel-heading"><div><h2>Competências conciliadas</h2><p>Histórico agregado por unidade, regra e competência.</p></div></div>
+      {error && <LoadFailure message={error} onRetry={load} />}
       {data?.summary && (
         <section className="kpi-grid reconciliation-kpis">
           <Kpi
@@ -2385,7 +2543,7 @@ function LegacyReconciliations({ user }) {
         </label>
       </div>
       {!data ? (
-        <Loading />
+        !error && <Loading />
       ) : data.items.length ? (
         <div className="reconciliation-list detailed-list">
           {data.items.map((row) => (
@@ -2469,8 +2627,6 @@ function LegacyReconciliations({ user }) {
           </button>
         </div>
       )}
-        </>
-      )}
       {selected && (
         <ReconciliationDetail
           reconciliationId={selected}
@@ -2483,13 +2639,6 @@ function LegacyReconciliations({ user }) {
   );
 }
 
-const queueScopeLabels = {
-  actionable: "Para tratar",
-  waiting: "Aguardando",
-  confirmed: "Confirmados",
-  all: "Todos",
-};
-
 const priorityLabels = {
   critical: "Crítica",
   high: "Alta",
@@ -2498,7 +2647,7 @@ const priorityLabels = {
   none: "Informativa",
 };
 
-function QueueChain({ detail, row, activeItem }) {
+export function QueueChain({ detail, row, activeItem }) {
   const selectedChain =
     detail.chains?.find(
       (chain) =>
@@ -2511,12 +2660,51 @@ function QueueChain({ detail, row, activeItem }) {
     row.rule_kind,
   );
   const firstEvidence = activeItem?.display_evidence?.[0] || detail.evidence?.[0];
+  const hasManagementAdjustment = detail.evidence?.some(
+    (evidence) => evidence.source === "MANAGEMENT_ADJUSTMENT",
+  );
   const portalCredit = activeItem?.display_evidence?.find(
     (evidence) => evidence.source === "IPIRANGA_PORTAL",
   );
   const portalProofConcluded = Boolean(
     portalCredit && activeItem?.details?.portal_postpaid_exact && activeItem?.status === "auto_confirmed",
   );
+  const portalUsage = activeItem?.item_type === "portal_credit_usage" || row.item_type === "portal_credit_usage";
+
+  if (portalUsage) {
+    const usageEvidence = activeItem?.display_evidence?.find(
+      (evidence) => evidence.source === "IPIRANGA_PORTAL_USAGE",
+    ) || firstEvidence;
+    const creditValue = usageEvidence?.value ?? activeItem?.observed_value ?? row.observed_value ?? 0;
+    const usedInvoice = usageEvidence?.document || row.document || "Não informada";
+    return (
+      <div className="queue-chain" aria-label="Cadeia do crédito usado no portal">
+        <div className="queue-chain-node">
+          <span>1. Crédito no portal</span>
+          <strong>{money(creditValue)}</strong>
+          <small>{usageEvidence?.date ? `Registrado em ${d(usageEvidence.date)}` : "Data informada no extrato"}</small>
+        </div>
+        <ChevronRight />
+        <div className="queue-chain-node">
+          <span>2. NF utilizada pelo portal</span>
+          <strong>{usedInvoice}</strong>
+          <small>Declarada pela Ipiranga como uso do crédito</small>
+        </div>
+        <ChevronRight />
+        <div className="queue-chain-node">
+          <span>3. Validação</span>
+          <strong>NF e chave conferidas</strong>
+          <small>Unidade, fornecedor e documento validados no ERP</small>
+        </div>
+        <ChevronRight />
+        <div className="queue-chain-node">
+          <span>4. Crédito confirmado</span>
+          <strong>{money(creditValue)}</strong>
+          <small>Comprova a utilização; a origem da bonificação é acompanhada no saldo acumulado</small>
+        </div>
+      </div>
+    );
+  }
 
   if (isInvoice) {
     return (
@@ -2570,9 +2758,9 @@ function QueueChain({ detail, row, activeItem }) {
       </div>
       <ChevronRight />
       <div className="queue-chain-node">
-        <span>4. Valor identificado</span>
-        <strong>{money(detail.observed_value + detail.manual_adjustment)}</strong>
-        <small>Esperado {money(detail.expected_value)}</small>
+        <span>{hasManagementAdjustment ? "4. Valor regularizado" : "4. Valor identificado"}</span>
+        <strong>{money(activeItem?.observed_value ?? (detail.observed_value + detail.manual_adjustment))}</strong>
+        <small>{hasManagementAdjustment ? "Ajuste gerencial aprovado" : `Esperado ${money(activeItem?.expected_value ?? detail.expected_value)}`}</small>
       </div>
     </div>
   );
@@ -2586,6 +2774,7 @@ function QueueActionForm({ action, onCancel, onSubmit, busy }) {
     accept: ["Confirmar vínculo", "Confirme por que a evidência é suficiente."],
     needs_information: ["Pedir informação", "Registre objetivamente o que falta para concluir."],
     reject: ["Rejeitar vínculo", "Registre por que o vínculo não deve ser considerado."],
+    respond_information: ["Responder e encerrar", "A resposta fica registrada no histórico; a pendência financeira não será alterada."],
     adjust: ["Registrar ajuste", "O ajuste é auditável e não altera a regra financeira."],
     confirm: ["Confirmar conciliação", "Registre a confirmação do gestor para esta competência."],
   };
@@ -2628,28 +2817,30 @@ function QueueActionForm({ action, onCancel, onSubmit, busy }) {
         </label>
       )}
       <label className="queue-action-notes">
-        Justificativa
+        {action === "respond_information" ? "Resposta" : "Justificativa"}
         <textarea
           value={notes}
           minLength="5"
           onChange={(event) => setNotes(event.target.value)}
-          placeholder="Descreva a conferência realizada."
+          placeholder={action === "respond_information" ? "Registre a resposta recebida." : "Descreva a conferência realizada."}
           required
         />
       </label>
       <div className="queue-action-buttons">
         <button className="secondary" type="button" onClick={onCancel} disabled={busy}>Cancelar</button>
-        <button className="primary" disabled={busy}>{busy ? "Salvando..." : "Salvar decisão"}</button>
+        <button className="primary" disabled={busy}>{busy ? "Salvando..." : action === "respond_information" ? "Encerrar solicitação" : "Salvar decisão"}</button>
       </div>
     </form>
   );
 }
 
 function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
+  useDrawerBehavior(onClose);
   const [detail, setDetail] = useState(null);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
   const [activeAction, setActiveAction] = useState("");
+  const [responseRequestId, setResponseRequestId] = useState("");
   const [file, setFile] = useState(null);
   const isAdmin = user.role === "admin";
   const loadCurrent = async () => {
@@ -2663,6 +2854,7 @@ function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
   useEffect(() => {
     setDetail(null);
     setActiveAction("");
+    setResponseRequestId("");
     loadCurrent();
   }, [row.reconciliation_id, row.item_id]);
   const activeItem = useMemo(() => {
@@ -2676,13 +2868,17 @@ function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
     try {
       if (["accept", "needs_information", "reject"].includes(activeAction)) {
         if (!activeItem) throw new Error("Não há item conciliável disponível para revisão.");
-        setDetail(
-          await post(`/reconciliations/items/${activeItem.id}/review`, {
-            action: activeAction,
-            reason_code: values.reasonCode,
-            notes: values.notes,
-          }),
-        );
+        await post(`/reconciliations/items/${activeItem.id}/review`, {
+          action: activeAction,
+          reason_code: values.reasonCode,
+          notes: values.notes,
+        });
+        await loadCurrent();
+      } else if (activeAction === "respond_information") {
+        if (!responseRequestId) throw new Error("Selecione a solicitação que será encerrada.");
+        await post(`/reconciliations/information-requests/${responseRequestId}/respond`, { notes: values.notes });
+        await loadCurrent();
+        setResponseRequestId("");
       } else if (activeAction === "adjust") {
         await post(`/reconciliations/${detail.id}/adjust`, {
           amount: values.amount,
@@ -2720,8 +2916,12 @@ function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
     }
   }
 
-  const canAccept = activeItem && Math.abs(Number(activeItem.difference_value || 0)) <= 0.01;
+  const reviewActions = reviewActionAvailability(activeItem);
+  const requests = informationRequests(detail?.information_requests || [], detail?.workspace?.items || []);
   const itemEvidence = activeItem?.display_evidence || detail?.evidence || [];
+  const hasManagementAdjustment = detail?.evidence?.some(
+    (evidence) => evidence.source === "MANAGEMENT_ADJUSTMENT",
+  );
   return (
     <div className="reconciliation-overlay" role="dialog" aria-modal="true" aria-label="Conferência da conciliação">
       <button className="drawer-backdrop" onClick={onClose} aria-label="Fechar" />
@@ -2745,8 +2945,8 @@ function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
                   <small>Ação sugerida: {row.action_label}</small>
                 </div>
                 <div className="queue-detail-values">
-                  <div><span>Esperado</span><strong>{money(row.expected_value)}</strong></div>
-                  <div><span>Identificado</span><strong>{money(row.observed_value)}</strong></div>
+                <div><span>{row.status === "late_payment" ? "Benefício não aplicável" : "Esperado"}</span><strong>{money(row.status === "late_payment" ? row.contractual_value : row.expected_value)}</strong></div>
+                  <div><span>{hasManagementAdjustment ? "Ajuste aprovado" : "Identificado"}</span><strong>{money(row.observed_value)}</strong></div>
                   <div className={Math.abs(Number(row.difference_value)) > 0.01 ? "negative" : ""}><span>Diferença</span><strong>{money(row.difference_value)}</strong></div>
                   <div><span>{row.rule_kind === "invoice_discount" ? "Vencimento do título" : "Vencimento"}</span><strong>{d(row.due_date)}</strong></div>
                 </div>
@@ -2772,6 +2972,27 @@ function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
                 ) : <Empty text="Ainda não há prova financeira vinculada a este item." />}
               </section>
 
+              {requests.length > 0 && (
+                <section className="detail-section information-requests">
+                  <div className="section-title"><Clock3 /><div><h3>Solicitações de informação</h3><p>Itens que dependem de retorno interno antes da conclusão.</p></div></div>
+                  <div className="information-request-list">
+                    {requests.map((request) => (
+                      <article className="information-request-card" key={request.id || request.itemId}>
+                        <header>
+                          <div><span className={`information-request-state${request.open ? "" : " is-closed"}`}>{request.open ? "Aguardando resposta interna" : "Encerrada"}</span><strong>{request.document === "Competência" ? request.document : `NF ${request.document}`}</strong></div>
+                          <small>{request.open ? `Solicitado por ${request.requestedBy} em ${d(request.requestedAt)}` : `Encerrada por ${request.closedBy || request.respondedBy || "Administrador"} em ${d(request.closedAt || request.respondedAt)}`}</small>
+                        </header>
+                        <div className="information-request-reason"><span>Motivo</span><strong>{request.reason}</strong></div>
+                        <p>{request.notes}</p>
+                        {request.response && <div className="information-request-response"><span>Resposta de {request.respondedBy || "Administrador"} em {d(request.respondedAt)}</span><p>{request.response}</p></div>}
+                        {isAdmin && request.open && !activeAction && <button className="secondary information-request-answer" disabled={busy} onClick={() => { setResponseRequestId(request.id); setActiveAction("respond_information"); }}><Pencil /> Responder e encerrar</button>}
+                        {isAdmin && request.open && activeAction === "respond_information" && responseRequestId === request.id && <QueueActionForm action="respond_information" busy={busy} onCancel={() => { setActiveAction(""); setResponseRequestId(""); }} onSubmit={submitAction} />}
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+
               {detail.workspace?.exceptions?.length > 0 && (
                 <section className="queue-exception-summary">
                   <AlertTriangle />
@@ -2785,13 +3006,14 @@ function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
                   <div className="section-title"><Pencil /><div><h3>Registrar decisão</h3><p>Toda ação exige justificativa e fica gravada na auditoria.</p></div></div>
                   {!activeAction ? (
                     <div className="queue-admin-actions">
-                      {canAccept && <button className="primary" disabled={busy} onClick={() => setActiveAction("accept")}><CheckCircle2 /> Confirmar vínculo</button>}
-                      <button className="secondary" disabled={busy} onClick={() => setActiveAction("needs_information")}><Clock3 /> Pedir informação</button>
-                      <button className="secondary" disabled={busy} onClick={() => setActiveAction("reject")}><X /> Rejeitar vínculo</button>
+                      {reviewActions.canAcceptLink && <button className="primary" disabled={busy} onClick={() => setActiveAction("accept")}><CheckCircle2 /> Confirmar vínculo</button>}
+                      {reviewActions.canRequestInformation && <button className="secondary" disabled={busy} onClick={() => setActiveAction("needs_information")}><Clock3 /> Pedir informação</button>}
+                      {reviewActions.canRejectLink && <button className="secondary" disabled={busy} onClick={() => setActiveAction("reject")}><X /> Rejeitar vínculo</button>}
+                      {!activeItem && <p className="queue-admin-unavailable">{reviewActions.unavailableMessage}</p>}
                       <button className="secondary" disabled={busy} onClick={() => setActiveAction("adjust")}><Pencil /> Registrar ajuste</button>
                       <button className="secondary" disabled={busy || row.state === "confirmed"} onClick={() => setActiveAction("confirm")}><ShieldCheck /> Confirmar competência</button>
                     </div>
-                  ) : <QueueActionForm action={activeAction} busy={busy} onCancel={() => setActiveAction("")} onSubmit={submitAction} />}
+                  ) : activeAction !== "respond_information" && <QueueActionForm action={activeAction} busy={busy} onCancel={() => setActiveAction("")} onSubmit={submitAction} />}
                   {row.rule_kind === "invoice_discount" && (
                     <div className="queue-boleto-upload">
                       <div><strong>Anexar boleto</strong><small>Prova auxiliar; a regra financeira não muda por este envio.</small></div>
@@ -2808,7 +3030,7 @@ function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
                   <div className="queue-audit-list">
                     <p><strong>Itens:</strong> {detail.workspace?.summary?.item_count || 0} • <strong>Exceções abertas:</strong> {detail.workspace?.summary?.open_exceptions || 0}</p>
                     {detail.review?.adjustments?.map((adjustment) => <p key={adjustment.id}>Ajuste {money(adjustment.amount)} • {adjustment.reason} • {d(adjustment.created_at)}</p>)}
-                    {detail.review?.history?.map((entry) => <p key={entry.id}>{entry.action} • {entry.created_by} • {d(entry.created_at)} • {entry.notes || "Sem observação"}</p>)}
+                    {detail.review?.history?.map((entry) => <p key={entry.id}>{reconciliationAuditActionLabel(entry.action)} • {entry.created_by} • {d(entry.created_at)} • {entry.notes || "Sem observação"}</p>)}
                   </div>
                   <details className="queue-json"><summary>JSON técnico</summary><pre>{JSON.stringify(detail.technical_evidence, null, 2)}</pre></details>
                 </details>
@@ -2821,7 +3043,7 @@ function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
   );
 }
 
-function Reconciliations({ user }) {
+function ReconciliationQueuePanel({ user }) {
   const location = useLocation();
   const queryValues = (key) => new URLSearchParams(location.search).getAll(key).filter(Boolean);
   const [data, setData] = useState(null);
@@ -2830,18 +3052,25 @@ function Reconciliations({ user }) {
   const [company, setCompany] = useState(() => queryValues("company"));
   const [ruleKind, setRuleKind] = useState(() => queryValues("rule_kind"));
   const [reference, setReference] = useState(() => queryValues("reference_month"));
-  const [scope, setScope] = useState(() => queryValues("scope")[0] || "actionable");
+  const initialStates = () => {
+    const values = queryValues("state");
+    if (values.length) return values;
+    const legacyScope = queryValues("scope")[0];
+    return legacyScope && legacyScope !== "all" ? [legacyScope] : ["actionable"];
+  };
+  const [states, setStates] = useState(initialStates);
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState(null);
   const [error, setError] = useState("");
   const load = async () => {
     setError("");
     try {
-      const query = new URLSearchParams({ page: String(page), page_size: "30", scope });
+      const query = new URLSearchParams({ page: String(page), page_size: "30", scope: "all" });
       unit.forEach((value) => query.append("unit", value));
       company.forEach((value) => query.append("company", value));
       ruleKind.forEach((value) => query.append("rule_kind", value));
       reference.forEach((value) => query.append("reference_month", value));
+      states.forEach((value) => query.append("state", value));
       setData(await get(`/reconciliations/work-queue?${query}`));
     } catch (err) {
       setError(err.message);
@@ -2854,21 +3083,23 @@ function Reconciliations({ user }) {
     setCompany(queryValues("company"));
     setRuleKind(queryValues("rule_kind"));
     setReference(queryValues("reference_month"));
-    setScope(queryValues("scope")[0] || "actionable");
+    setStates(initialStates());
     setPage(1);
     setSelected(null);
   }, [location.search]);
-  useEffect(() => { load(); }, [unit, company, ruleKind, reference, scope, page]);
+  useEffect(() => { load(); }, [unit, company, ruleKind, reference, states, page]);
   const updateFilter = (setter) => (value) => { setPage(1); setSelected(null); setter(value); };
-  const emptyText = scope === "actionable" ? "Não há itens que exijam ação nos filtros selecionados." : "Nenhum item para os filtros selecionados.";
+  const onlyActionable = states.length === 1 && states[0] === "actionable";
+  const waitingCount = Number(data?.summary?.waiting || 0);
+  const emptyText = onlyActionable ? "Não há itens que exijam ação nos filtros selecionados." : "Nenhum item para os filtros selecionados.";
   const monthOptions = rollingMonthOptions();
   const unitOptions = units.map((row) => ({ value: row.code, label: `${row.code} • ${unitName(row)}` }));
   const unitByCode = Object.fromEntries(units.map((row) => [row.code, row]));
   const companyOptions = [{ value: "IPIRANGA", label: "Ipiranga" }, { value: "BR", label: "BR / Vibra" }, { value: "SHELL", label: "Shell / Raízen" }, { value: "TEXACO", label: "Texaco" }];
   const ruleOptions = Object.entries(ruleLabels).map(([value, label]) => ({ value, label }));
+  const stateOptions = [{ value: "actionable", label: "Para tratar" }, { value: "waiting", label: "Aguardando" }, { value: "confirmed", label: "Confirmados" }];
   return (
     <>
-      <PageHeader eyebrow="CONCILIAÇÃO" title="Fila de conciliação" subtitle="Comece pelo que precisa de ação. Os confirmados ficam no histórico, sem esconder a rastreabilidade." />
       {error && <div className="form-error">{error}</div>}
       <section className="kpi-grid queue-kpis">
         <Kpi icon={AlertTriangle} label="Itens a tratar" value={n(data?.summary?.to_treat)} detail="Pendências e divergências abertas" tone="orange" />
@@ -2882,7 +3113,7 @@ function Reconciliations({ user }) {
           <MultiSelect label="Companhias" options={companyOptions} value={company} onChange={updateFilter(setCompany)} />
           <MultiSelect label="Modalidades" options={ruleOptions} value={ruleKind} onChange={updateFilter(setRuleKind)} />
           <MultiSelect label="Competências" options={monthOptions} value={reference} onChange={updateFilter(setReference)} />
-          <label>Situação<select value={scope} onChange={(event) => updateFilter(setScope)(event.target.value)}>{Object.entries(queueScopeLabels).map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select></label>
+          <MultiSelect label="Situações" options={stateOptions} value={states} onChange={updateFilter(setStates)} placeholder="Todas" />
         </div>
       </section>
       {!data ? <Loading /> : data.items.length ? (
@@ -2891,23 +3122,39 @@ function Reconciliations({ user }) {
             <article className={`queue-row priority-${item.priority}`} key={item.id}>
               <div className="queue-priority"><span>{priorityLabels[item.priority]}</span><strong>{item.unit_code}</strong></div>
               <div className="queue-main"><strong>{item.document ? `NF ${item.document}` : month(item.reference_month)}</strong><span><BrandLogo brand={unitByCode[item.unit_code]?.brand || item.company_code} compact /> {unitName(unitByCode[item.unit_code], `Unidade ${item.unit_code}`)} • {ruleLabels[item.rule_kind] || item.rule_kind}</span><small>{item.description}</small></div>
-              <div className="queue-values"><div><span>Esperado</span><strong>{money(item.expected_value)}</strong></div><div><span>Identificado</span><strong>{money(item.observed_value)}</strong></div><div className={Math.abs(Number(item.difference_value)) > 0.01 ? "negative" : ""}><span>Diferença</span><strong>{money(item.difference_value)}</strong></div></div>
+              <div className="queue-values"><div><span>{item.status === "late_payment" ? "Benefício não aplicável" : "Esperado"}</span><strong>{money(item.status === "late_payment" ? item.contractual_value : item.expected_value)}</strong></div><div><span>Identificado</span><strong>{money(item.observed_value)}</strong></div><div className={Math.abs(Number(item.difference_value)) > 0.01 ? "negative" : ""}><span>Diferença</span><strong>{money(item.difference_value)}</strong></div></div>
               <div className="queue-missing"><Badge status={item.status} /><strong>{item.action_label}</strong><span>{item.reason}</span><small>Vence {d(item.due_date)}{item.open_exception_count ? ` • ${item.open_exception_count} alerta(s)` : ""}</small></div>
               <button className="secondary queue-open" onClick={() => setSelected({ ...item, unit: unitByCode[item.unit_code] })}><Eye /> Conferir</button>
             </article>
           ))}
         </section>
-      ) : <Empty text={emptyText} />}
+      ) : onlyActionable && waitingCount > 0 ? <section className="queue-waiting-context"><Empty text="Não há pendência financeira para tratar nos filtros selecionados." /><div className="queue-waiting-actions"><Clock3 /><span>Há {n(waitingCount)} item(ns) aguardando vencimento, baixa ou arquivo externo.</span><button className="secondary" type="button" onClick={() => updateFilter(setStates)(["waiting"])}>Ver itens aguardando</button></div></section> : <Empty text={emptyText} />}
       {data?.pages > 1 && <div className="pagination"><button className="secondary" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Anterior</button><span>Página {page} de {data.pages}</span><button className="secondary" disabled={page >= data.pages} onClick={() => setPage((value) => value + 1)}>Próxima</button></div>}
       {selected && <QueueReconciliationDetail row={selected} user={user} onClose={() => setSelected(null)} onChanged={load} />}
     </>
   );
 }
 
+export function Reconciliations({ user }) {
+  return <>
+    <PageHeader
+      eyebrow="CONCILIAÇÃO"
+      title="Fila de conciliação"
+      subtitle="Comece pelo que precisa de ação. Os confirmados ficam no histórico, sem esconder a rastreabilidade."
+    />
+    <ReconciliationQueuePanel user={user} />
+  </>;
+}
+
 const routineSituationMeta = {
   automatic: { title: "Fechou automaticamente", badge: "confirmed" },
   awaiting_source: { title: "Aguardando arquivo externo", badge: "pending" },
+  awaiting_due: { title: "Aguardando vencimento", badge: "pending" },
+  awaiting_settlement: { title: "Aguardando baixa", badge: "pending" },
+  awaiting_competence: { title: "Aguardando identificação da competência", badge: "pending" },
+  awaiting_portal_credit: { title: "Aguardando crédito no portal", badge: "pending" },
   analysis: { title: "Em análise", badge: "review_required" },
+  awaiting_statement: { title: "Aguardando próximo extrato", badge: "pending" },
 };
 
 function RaizenReceiptAllocation({ receipt, onSaved }) {
@@ -2946,7 +3193,7 @@ function RaizenReceiptAllocation({ receipt, onSaved }) {
   </article>;
 }
 
-function MonthlyRoutine({ user }) {
+export function MonthlyRoutine({ user }) {
   const [data, setData] = useState(null);
   const [units, setUnits] = useState([]);
   const [reference, setReference] = useState([isoMonth()]);
@@ -2977,7 +3224,7 @@ function MonthlyRoutine({ user }) {
   const monthOptions = rollingMonthOptions();
   const unitOptions = units.map((row) => ({ value: row.code, label: `${row.code} • ${unitName(row)}` }));
   const companyOptions = [{ value: "IPIRANGA", label: "Ipiranga" }, { value: "BR", label: "BR / Vibra" }, { value: "SHELL", label: "Shell / Raízen" }, { value: "TEXACO", label: "Texaco" }];
-  const situationOptions = [{ value: "automatic", label: "Fechou automaticamente" }, { value: "awaiting_source", label: "Aguardando arquivo" }, { value: "analysis", label: "Em análise" }];
+  const situationOptions = [{ value: "automatic", label: "Fechou automaticamente" }, { value: "awaiting_source", label: "Aguardando arquivo" }, { value: "awaiting_due", label: "Aguardando vencimento" }, { value: "awaiting_settlement", label: "Aguardando baixa" }, { value: "awaiting_competence", label: "Aguardando competência" }, { value: "awaiting_portal_credit", label: "Aguardando crédito no portal" }, { value: "awaiting_statement", label: "Aguardando próximo extrato" }, { value: "analysis", label: "Em análise" }];
   async function importEvidence(event, card) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -2997,13 +3244,13 @@ function MonthlyRoutine({ user }) {
       setUploadingId("");
     }
   }
-  const groups = ["awaiting_source", "analysis", "automatic"];
+  const groups = ["awaiting_source", "awaiting_due", "awaiting_settlement", "awaiting_competence", "awaiting_portal_credit", "awaiting_statement", "analysis", "automatic"];
   return <>
     <PageHeader eyebrow="OPERAÇÃO DE BONIFICAÇÕES" title="Rotina mensal" subtitle="Veja o que fecha pelo ERP, importe apenas as provas externas necessárias e mantenha cada competência rastreável." />
     {error && <div className="form-error">{error}</div>}
     <section className="kpi-grid routine-kpis">
       <Kpi icon={ShieldCheck} label="Fechados" value={n(data?.summary?.automatic)} detail="Sem nova ação humana" tone="green" />
-      <Kpi icon={FileUp} label="Aguardando arquivo" value={n(data?.summary?.awaiting_source)} detail="Prova externa ainda não importada" tone="orange" />
+      <Kpi icon={FileUp} label="Aguardando" value={n(Number(data?.summary?.awaiting_source || 0) + Number(data?.summary?.awaiting_due || 0) + Number(data?.summary?.awaiting_settlement || 0) + Number(data?.summary?.awaiting_competence || 0) + Number(data?.summary?.awaiting_portal_credit || 0) + Number(data?.summary?.awaiting_statement || 0))} detail="Arquivo, vencimento, baixa, competência, crédito ou extrato pendente" tone="orange" />
       <Kpi icon={AlertTriangle} label="Em análise" value={n(data?.summary?.analysis)} detail="Diferença, baixa ou vínculo a acompanhar" tone="red" />
       <Kpi icon={WalletCards} label="Valor em aberto" value={money(data?.summary?.open_value)} detail="Somente competências não concluídas" tone="blue" />
     </section>
@@ -3018,15 +3265,23 @@ function MonthlyRoutine({ user }) {
       {groups.map((group) => {
         const rows = data.cards.filter((card) => card.situation === group);
         const meta = routineSituationMeta[group];
-        const subtitle = group === "automatic" ? "Competências concluídas ou sem valor liberado no período." : group === "awaiting_source" ? "Importe somente a fonte indicada para cada unidade." : "Há evidência, baixa ou vínculo que ainda precisa acompanhar.";
+        const subtitle = group === "automatic" ? "Unidades e competências concluídas ou sem valor liberado no período." : group === "awaiting_source" ? "Importe somente a fonte indicada para cada unidade." : group === "awaiting_due" ? "A competência ainda está dentro do prazo e não exige cobrança ou análise." : group === "awaiting_settlement" ? "Há títulos sem baixa no ERP; o valor não é tratado como falta de bonificação até a liquidação." : group === "awaiting_competence" ? "O extrato contém crédito, mas não identifica a competência; a fila abre em Aguardando, sem criar divergência financeira." : group === "awaiting_portal_credit" ? "O extrato foi importado, mas ainda não contém um crédito vinculável à competência; a fila abre em Aguardando." : group === "awaiting_statement" ? "Há saldo de compras posteriores ao último extrato; acompanhe a próxima atualização sem criar pendência por NF." : "Há evidência, baixa ou vínculo que ainda precisa acompanhar.";
         return <section className="routine-section" key={group}>
           <div className="section-title"><div><h3>{meta.title}</h3><p>{subtitle}</p></div><Badge status={meta.badge}>{rows.length}</Badge></div>
           {rows.length ? <div className="routine-card-grid">{rows.map((card) => <article className={`routine-card routine-${card.situation}`} key={card.id}>
             <header><div className="routine-card-unit"><span className="routine-unit-code">{card.unit_code}</span><BrandLogo brand={card.brand || card.company_code} compact /><div><strong>{unitName({ display_name: card.unit_name }, `Unidade ${card.unit_code}`)}</strong><span>{card.company_code} • {card.rule_label}</span></div></div><Badge status={meta.badge}>{card.confirmation_mode === "automatic" && card.situation === "automatic" ? "Automático" : meta.title}</Badge></header>
-            <div className="routine-card-values"><div><span>Esperado</span><strong>{money(card.expected_value)}</strong></div><div><span>Identificado</span><strong>{money(card.observed_value)}</strong></div><div className={Math.abs(Number(card.difference_value || 0)) > 0.01 ? "negative" : ""}><span>Diferença</span><strong>{money(card.difference_value)}</strong></div></div>
+            <div className="routine-card-values"><div><span>{card.cumulative ? "Esperado acumulado" : "Esperado"}</span><strong>{money(card.expected_value)}</strong></div><div><span>{card.cumulative ? "Créditos apropriados" : "Identificado"}</span><strong>{money(card.observed_value)}</strong></div><div className={Math.abs(Number(card.difference_value || 0)) > 0.01 ? "negative" : ""}><span>{card.cumulative ? "Saldo efetivo" : "Diferença"}</span><strong>{money(card.difference_value)}</strong></div></div>
+            {card.cumulative && <div className="routine-cumulative-note">
+              <span>Até {d(card.as_of_date)} • <strong>{n(card.credit_event_count)} crédito(s) postecipado(s) no portal</strong></span>
+              {card.latest_import ? <small>Último extrato: {card.latest_import.original_filename} • {d(card.latest_import.period_start)} a {d(card.latest_import.period_end)} • {n(card.latest_import.imported_count)} crédito(s) novo(s).</small> : <small>Nenhum extrato Ipiranga foi importado ainda.</small>}
+              {Number(card.portal_unallocated_value || 0) > 0.01 && <small>Crédito residual no portal: {money(card.portal_unallocated_value)}. Créditos brutos emitidos: {money(card.portal_credit_total_value)}. Este saldo não representa diferença contratual.</small>}
+              {Number(card.historical_adjustment_value || 0) > 0.01 && <small>{card.adjustment_note || "Ajuste histórico acompanhado"}: {money(card.historical_adjustment_value)}. Saldo antes do ajuste: {money(card.portal_difference_value)}.</small>}
+              {Number(card.next_statement_expected_value || 0) > 0.01 && <small>Compras posteriores aguardando extrato: {money(card.next_statement_expected_value)}.</small>}
+            </div>}
             <div className="routine-next-action"><FileUp /><div><strong>{card.action}</strong><span>{card.description}</span>{card.due_date && <small>Vencimento da competência: {d(card.due_date)}</small>}</div></div>
-            {isAdmin && card.source_type !== "erp" && card.situation !== "automatic" && <form className="routine-upload" onSubmit={(event) => importEvidence(event, card)}>{card.source_type !== "raizen_receipt" && <input type="hidden" name="unit_code" value={card.unit_code} />}<label><span>{card.source.label} ({card.source.formats.join(", ")})</span><input name="file" type="file" accept={card.source.formats.join(",")} required /></label><button className="primary" disabled={uploadingId === card.id}><FileUp /> {uploadingId === card.id ? "Importando..." : card.situation === "analysis" ? "Importar atualização" : "Importar"}</button></form>}
-            {card.imports.length > 0 && <details className="routine-files"><summary>{card.imports.length} arquivo(s) vinculado(s) à competência</summary>{card.imports.map((item) => <a href={item.file_url} key={item.id}><FileText /> <span>{item.original_filename} • {item.imported_count} novo(s), {item.duplicate_count} duplicado(s)</span><small>SHA {item.content_sha256.slice(0, 12)}…</small></a>)}</details>}
+            {isAdmin && card.source_type !== "erp" && card.situation !== "automatic" && <form className="routine-upload" onSubmit={(event) => importEvidence(event, card)}>{card.source_type !== "raizen_receipt" && <input type="hidden" name="unit_code" value={card.unit_code} />}<label><span>{card.source.label} ({card.source.formats.join(", ")})</span><input name="file" type="file" accept={card.source.formats.join(",")} required /></label><button className="primary" disabled={uploadingId === card.id}><FileUp /> {uploadingId === card.id ? "Importando..." : card.situation === "analysis" || card.imports.length ? "Importar atualização" : "Importar"}</button></form>}
+            {card.imports.length > 0 && <details className="routine-files"><summary>{card.imports.length} arquivo(s) vinculado(s) {card.cumulative ? "à unidade" : "à competência"}</summary>{card.imports.map((item) => <a href={item.file_url} key={item.id}><FileText /> <span>{item.original_filename} • {item.imported_count} novo(s), {item.duplicate_count} duplicado(s)</span><small>SHA {item.content_sha256.slice(0, 12)}…</small></a>)}</details>}
+            {card.cumulative && card.competencies?.length > 0 && <details className="routine-cumulative-history"><summary>Ver histórico por competência e créditos</summary><div className="routine-cumulative-history-grid"><div><strong>Competências</strong>{card.competencies.map((item) => <span key={item.reference_month}>{month(item.reference_month)} • esperado {money(item.expected_value)}{Number(item.adjustment_value || 0) > 0.01 ? ` • ajuste ${money(item.adjustment_value)}` : ""}</span>)}</div><div><strong>Créditos do portal</strong>{card.credit_history.map((item, index) => <span key={`${item.date}-${item.document || index}`}>{d(item.date)} • {money(item.value)}{item.document ? ` • NF ${item.document}` : ""}</span>)}</div></div></details>}
             <div className="routine-card-actions"><Link className="secondary link-button" to={card.queue_url}><Eye /> Abrir conciliação</Link></div>
           </article>)}</div> : <Empty text="Nenhuma competência neste grupo com os filtros selecionados." />}
         </section>;
@@ -3041,20 +3296,30 @@ function Reports({ user }) {
   const [rows, setRows] = useState(null);
   const [reference, setReference] = useState(isoMonth());
   const [busy, setBusy] = useState(false);
-  const load = () => get("/reports/monthly").then(setRows);
+  const [error, setError] = useState("");
+  const load = async () => {
+    setError("");
+    try {
+      setRows(await get("/reports/monthly"));
+    } catch (err) {
+      setError(err.message);
+      setRows([]);
+    }
+  };
   useEffect(() => {
     load();
   }, []);
   async function create(send) {
     setBusy(true);
+    setError("");
     try {
       await post("/reports/monthly", {
         reference_month: `${reference}-01`,
         send,
       });
-      load();
-    } catch (e) {
-      alert(e.message);
+      await load();
+    } catch (err) {
+      setError(err.message);
     } finally {
       setBusy(false);
     }
@@ -3091,10 +3356,12 @@ function Reports({ user }) {
           )
         }
       />
+      {error && <div className="form-error">{error}</div>}
       {!rows ? (
         <Loading />
       ) : rows.length ? (
         <div className="panel table-panel">
+          <div className="table-toolbar"><span>{rows.length} relatório(s) no histórico</span><ExcelExportButton filename="historico-de-relatorios" sheetName="Relatórios" rows={rows} columns={[{ label: "Competência", value: (row) => month(row.reference_month) }, { label: "Criado em", value: (row) => d(row.created_at) }, { label: "Status", value: (row) => row.status }, { label: "Tentativas", value: (row) => Number(row.attempts || 0) }, { label: "ID do provedor", value: (row) => row.provider_message_id || "" }, { label: "Detalhe", value: (row) => row.error_message || "" }]} /></div>
           <div className="table-scroll">
             <table>
               <thead>
@@ -3126,6 +3393,7 @@ function Reports({ user }) {
                         <a
                           className="icon-button"
                           href={`/api/reports/${row.id}/download`}
+                          aria-label={`Baixar relatório de ${month(row.reference_month)}`}
                         >
                           <Download />
                         </a>
@@ -3134,6 +3402,7 @@ function Reports({ user }) {
                   </tr>
                 ))}
               </tbody>
+              <tfoot><tr><th colSpan="3">Total</th><th>{n(sumRows(rows, "attempts"))}</th><th colSpan="3" /></tr></tfoot>
             </table>
           </div>
         </div>
@@ -3194,13 +3463,23 @@ const configSets = {
 function ConfigSection({ type, rows, reload }) {
   const cfg = configSets[type];
   const [editing, setEditing] = useState(null);
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const requiredFields = {
+    contracts: new Set(["unit_code", "company_code", "start_date", "term_months", "total_liters"]),
+    rules: new Set(["unit_code", "company_code", "kind", "effective_from"]),
+    aliases: new Set(["company_code", "effective_from"]),
+  }[type];
   function start(row = {}) {
     const initial = {};
     cfg.fields.forEach(([key]) => (initial[key] = row[key] ?? ""));
-    setEditing({ id: row.id, ...initial });
+    setError("");
+    setEditing({ id: row.id, active: row.active ?? true, ...initial });
   }
   async function save(event) {
     event.preventDefault();
+    setError("");
+    setBusy(true);
     const payload = {};
     cfg.fields.forEach(([key, , kind]) => {
       let value = editing[key];
@@ -3208,18 +3487,44 @@ function ConfigSection({ type, rows, reload }) {
       else if (kind === "number") value = Number(value);
       payload[key] = value;
     });
-    if (type === "contracts" && !payload.status) payload.status = "active";
+    if (type === "contracts") {
+      payload.upfront_total ??= 0;
+      payload.upfront_per_liter ??= 0;
+      payload.postpaid_per_liter ??= 0;
+      if (!payload.status) payload.status = "active";
+    }
     if (type === "rules") {
-      payload.active = true;
+      payload.active = editing.active;
+      payload.rate_per_liter ??= 0;
       payload.due_month_offset ??= 1;
       payload.applies_to ||= "all_fuel";
     }
-    if (type === "aliases") payload.active = true;
-    await (editing.id
-      ? patch(`/admin/${type}/${editing.id}`, payload)
-      : post(`/admin/${type}`, payload));
-    setEditing(null);
-    reload();
+    if (type === "aliases") payload.active = editing.active;
+    try {
+      await (editing.id
+        ? patch(`/admin/${type}/${editing.id}`, payload)
+        : post(`/admin/${type}`, payload));
+      setEditing(null);
+      reload();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function deactivate(row) {
+    if (!window.confirm(`Inativar este registro de ${cfg.title.toLowerCase()}?`)) return;
+    setError("");
+    setBusy(true);
+    try {
+      await remove(`/admin/${type}/${row.id}`);
+      if (editing?.id === row.id) setEditing(null);
+      await reload();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
   }
   return (
     <section className="admin-section">
@@ -3241,6 +3546,7 @@ function ConfigSection({ type, rows, reload }) {
                 type={kind || "text"}
                 value={editing[key]}
                 step={kind === "number" ? "any" : undefined}
+                required={requiredFields.has(key)}
                 onChange={(e) =>
                   setEditing({ ...editing, [key]: e.target.value })
                 }
@@ -3255,30 +3561,48 @@ function ConfigSection({ type, rows, reload }) {
             >
               Cancelar
             </button>
-            <button className="primary">Salvar</button>
+            <button className="primary" disabled={busy}>{busy ? "Salvando..." : "Salvar"}</button>
           </div>
+          {error && <div className="form-error">{error}</div>}
         </form>
       )}
+      {!editing && error && <div className="form-error">{error}</div>}
       <div className="compact-list">
         {rows.map((row) => (
-          <button key={row.id} onClick={() => start(row)}>
-            <span className="unit-chip">{row.unit_code || "GERAL"}</span>
-            <div>
-              <strong>
-                {type === "contracts"
-                  ? `${row.company_code} • ${n(row.total_liters)} L`
-                  : type === "rules"
-                    ? ruleLabels[row.kind] || row.kind
-                    : `${row.company_code} • ${row.cnpj || row.legal_name_pattern}`}
-              </strong>
-              <small>
-                {type === "contracts"
-                  ? `${d(row.start_date)} — ${d(row.end_date)}`
-                  : `Desde ${d(row.effective_from)}`}
-              </small>
-            </div>
-            <Pencil />
-          </button>
+          <div className="config-list-row" key={row.id}>
+            <button
+              type="button"
+              className="config-list-edit"
+              aria-label={`Editar ${type} ${row.id}`}
+              onClick={() => start(row)}
+            >
+              <span className="unit-chip">{row.unit_code || "GERAL"}</span>
+              <div>
+                <strong>
+                  {type === "contracts"
+                    ? `${row.company_code} • ${n(row.total_liters)} L`
+                    : type === "rules"
+                      ? ruleLabels[row.kind] || row.kind
+                      : `${row.company_code} • ${row.cnpj || row.legal_name_pattern}`}
+                </strong>
+                <small>
+                  {type === "contracts"
+                    ? `${d(row.start_date)} — ${d(row.end_date)}`
+                    : `Desde ${d(row.effective_from)}`}
+                </small>
+              </div>
+              <Pencil />
+            </button>
+            <button
+              type="button"
+              className="icon-button danger"
+              aria-label={`Inativar ${type} ${row.id}`}
+              disabled={busy}
+              onClick={() => deactivate(row)}
+            >
+              <X />
+            </button>
+          </div>
         ))}
       </div>
     </section>
@@ -3395,9 +3719,10 @@ function PortalIpirangaPanel({ data, onUpload, uploading, error, onPortalChange 
       </div>
 
       <section className="portal-book">
-        <div className="section-title">
-          <WalletCards />
-          <div><h3>Livro da bonificação postecipada</h3><p>Esperado, concedido no portal e diferença por ciclo contratual.</p></div>
+        <div className="section-title section-title-wrap">
+          <div className="section-title-main"><WalletCards />
+          <div><h3>Livro da bonificação postecipada</h3><p>Esperado, concedido no portal e diferença por ciclo contratual.</p></div></div>
+          <ExcelExportButton filename="livro-ipiranga-001" sheetName="Livro Ipiranga" rows={data.cycles} columns={[{ label: "Ciclo", value: (row) => row.cycle_number }, { label: "Início", value: (row) => d(row.period_start) }, { label: "Fim", value: (row) => d(row.period_end) }, { label: "Notas", value: (row) => Number(row.purchase_count || 0) }, { label: "Litros", value: (row) => Number(row.liters || 0) }, { label: "Esperado", value: (row) => Number(row.expected_value || 0) }, { label: "Portal", value: (row) => Number(row.observed_value || 0) }, { label: "Diferença", value: (row) => Number(row.difference_value || 0) }, { label: "Status", value: (row) => row.status }]} />
         </div>
         <div className="portal-table-wrap">
           <table className="portal-table">
@@ -3411,6 +3736,7 @@ function PortalIpirangaPanel({ data, onUpload, uploading, error, onPortalChange 
                 </tr>
               ))}
             </tbody>
+            <tfoot><tr><th>Total</th><th /><th>{n(sumRows(data.cycles, "purchase_count"))}</th><th>{n(sumRows(data.cycles, "liters"), 3)} L</th><th>{money(sumRows(data.cycles, "expected_value"))}</th><th>{money(sumRows(data.cycles, "observed_value"))}</th><th>{money(sumRows(data.cycles, "difference_value"))}</th><th /></tr></tfoot>
           </table>
         </div>
       </section>
@@ -3827,8 +4153,8 @@ function FreightRatesAdmin({ rows, reload, carrierRows = [] }) {
           <div className="avatar"><Truck /></div>
           <div><strong>{row.carrier_name || row.carrier_cnpj}</strong><span>{row.origin_cnpj ? `Origem ${row.origin_cnpj}` : "Todas as origens"} • {row.unit_code ? `Unidade ${row.unit_code}` : "Todas as unidades"}</span><small>{d(row.effective_from)} a {row.effective_to ? d(row.effective_to) : "sem data final"}</small></div>
           <div className="freight-rate-amount"><strong>{rateMoney(row.rate_per_liter)} / L</strong><Badge status={row.active ? "confirmed" : "canceled"}>{row.active ? "Ativa" : "Inativa"}</Badge></div>
-          <button className="icon-button" onClick={() => start(row)} title="Editar"><Pencil /></button>
-          {row.active && <button className="icon-button danger" onClick={() => deactivate(row)} title="Desativar"><X /></button>}
+          <button className="icon-button" onClick={() => start(row)} title="Editar" aria-label={`Editar tarifa de ${row.carrier_name} vigente desde ${d(row.effective_from)}`}><Pencil /></button>
+          {row.active && <button className="icon-button danger" onClick={() => deactivate(row)} title="Desativar" aria-label={`Desativar tarifa de ${row.carrier_name} vigente desde ${d(row.effective_from)}`}><X /></button>}
         </div>)}
         {!rows.length && <Empty text="Nenhuma tarifa cadastrada." />}
       </div>
@@ -3898,7 +4224,7 @@ function UnitSettings({ rows, reload }) {
   return <section className="admin-section"><div className="panel-heading"><div><h2>Nome comercial e identificação dos postos</h2><p>O nome exibido em toda a plataforma é editável e não é sobrescrito pela sincronização.</p></div></div>{error && <div className="form-error">{error}</div>}{editing && <form className="config-form" onSubmit={save}><label>Nome do posto<input value={editing.display_name} onChange={(event) => setEditing({ ...editing, display_name: event.target.value })} required /></label><label>Cidade<input value={editing.city} onChange={(event) => setEditing({ ...editing, city: event.target.value })} /></label><label>Bandeira<select value={editing.brand} onChange={(event) => setEditing({ ...editing, brand: event.target.value })}><option value="">Não informada</option><option value="IPIRANGA">Ipiranga</option><option value="BR">BR</option><option value="SHELL">Shell</option><option value="TEXACO">Texaco</option></select></label><div className="form-buttons"><button type="button" className="ghost" onClick={() => setEditing(null)}>Cancelar</button><button className="primary">Salvar</button></div></form>}<div className="compact-list">{rows.map((row) => <button type="button" key={row.code} onClick={() => start(row)}><span className="unit-chip">{row.code}</span><div><strong>{unitName(row)}</strong><small>{row.city || "Cidade não informada"} • {row.brand || "Bandeira não informada"}</small></div><BrandLogo brand={row.brand} /><Pencil /></button>)}</div></section>;
 }
 
-function Administration() {
+export function Administration() {
   const [tab, setTab] = useState("users");
   const [data, setData] = useState({
     users: [],
@@ -3908,63 +4234,125 @@ function Administration() {
     aliases: [],
     units: [],
     freightRates: [],
+    freightCarriers: [],
     sync: [],
     portal: null,
     portalTexaco: null,
   });
   const [portalUnit, setPortalUnit] = useState("001");
-  const [loading, setLoading] = useState(true);
+  const [resourceState, setResourceState] = useState(() =>
+    Object.fromEntries(
+      ["users", "recipients", "contracts", "rules", "aliases", "units", "freightRates", "sync", "portal", "portalTexaco"].map(
+        (key) => [key, { loading: false, loaded: false, error: "" }],
+      ),
+    ),
+  );
+  const [error, setError] = useState("");
+  const [actionBusy, setActionBusy] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [portalError, setPortalError] = useState("");
-  const load = () => {
-    setLoading(true);
-    const resources = [
-      ["users", "users"],
-      ["recipients", "recipients"],
-      ["contracts", "contracts"],
-      ["rules", "rules"],
-      ["aliases", "aliases"],
-      ["sync", "sync"],
-      ["freightRates", "freight-rates"],
-    ];
-    const keys = [...resources.map(([key]) => key), "units", "portal", "portalTexaco"];
-    Promise.all([
-      ...resources.map(([, endpoint]) => get(`/admin/${endpoint}`)),
-      get("/units"),
-      get("/portal-statements/ipiranga/001"),
-      get("/portal-statements/texaco/050"),
-    ])
-      .then((values) =>
-        setData(
-          Object.fromEntries(
-            values.map((value, index) => [keys[index], value]),
-          ),
-        ),
-      )
-      .finally(() => setLoading(false));
-  };
-  useEffect(() => {
-    load();
-  }, []);
-  async function addUser(e) {
-    e.preventDefault();
-    const form = e.currentTarget;
-    const f = new FormData(form);
-    await post("/admin/users", Object.fromEntries(f));
-    form.reset();
-    load();
+  const [editingUser, setEditingUser] = useState(null);
+  const [editingRecipient, setEditingRecipient] = useState(null);
+  const activeResourceKey = tab === "portal" && portalUnit === "050" ? "portalTexaco" : tab;
+
+  async function loadResource(key, force = false) {
+    if (!force && (resourceState[key]?.loading || resourceState[key]?.loaded)) return;
+    setResourceState((current) => ({
+      ...current,
+      [key]: { ...current[key], loading: true, error: "" },
+    }));
+    try {
+      let result;
+      if (key === "units") result = await get("/units");
+      else if (key === "portal") result = await get("/portal-statements/ipiranga/001");
+      else if (key === "portalTexaco") result = await get("/portal-statements/texaco/050");
+      else if (key === "freightRates") {
+        const [rates, carriers] = await Promise.all([
+          get("/admin/freight-rates"),
+          get("/admin/freight-carriers"),
+        ]);
+        result = rates;
+        setData((current) => ({ ...current, freightCarriers: carriers }));
+      } else {
+        const endpoint = {
+          users: "users",
+          recipients: "recipients",
+          contracts: "contracts",
+          rules: "rules",
+          aliases: "aliases",
+          sync: "sync",
+        }[key];
+        result = await get(`/admin/${endpoint}`);
+      }
+      setData((current) => ({ ...current, [key]: result }));
+      setResourceState((current) => ({
+        ...current,
+        [key]: { loading: false, loaded: true, error: "" },
+      }));
+    } catch (err) {
+      setResourceState((current) => ({
+        ...current,
+        [key]: { loading: false, loaded: false, error: err.message },
+      }));
+    }
   }
-  async function addRecipient(e) {
+  const load = () => loadResource(activeResourceKey, true);
+  useEffect(() => {
+    loadResource(activeResourceKey);
+  }, [activeResourceKey]);
+  async function saveUser(e) {
     e.preventDefault();
     const form = e.currentTarget;
     const f = new FormData(form);
-    await post("/admin/recipients", { ...Object.fromEntries(f), active: true });
-    form.reset();
-    load();
+    const payload = Object.fromEntries(f);
+    payload.active = editingUser?.active ?? true;
+    if (!payload.password) delete payload.password;
+    setActionBusy(true);
+    setError("");
+    try {
+      await (editingUser
+        ? patch(`/admin/users/${editingUser.id}`, payload)
+        : post("/admin/users", payload));
+      setEditingUser(null);
+      form.reset();
+      await loadResource("users", true);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setActionBusy(false);
+    }
+  }
+  async function saveRecipient(e) {
+    e.preventDefault();
+    const form = e.currentTarget;
+    const f = new FormData(form);
+    const payload = { ...Object.fromEntries(f), active: editingRecipient?.active ?? true };
+    setActionBusy(true);
+    setError("");
+    try {
+      await (editingRecipient
+        ? patch(`/admin/recipients/${editingRecipient.id}`, payload)
+        : post("/admin/recipients", payload));
+      setEditingRecipient(null);
+      form.reset();
+      await loadResource("recipients", true);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setActionBusy(false);
+    }
   }
   async function sync(kind = "incremental") {
-    await post(`/admin/sync?kind=${kind}`);
-    load();
+    setActionBusy(true);
+    setError("");
+    try {
+      await post(`/admin/sync?kind=${kind}`);
+      await loadResource("sync", true);
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setActionBusy(false);
+    }
   }
   async function uploadPortal(event) {
     event.preventDefault();
@@ -3986,7 +4374,6 @@ function Administration() {
       setUploading(false);
     }
   }
-  if (loading) return <Loading />;
   return (
     <>
       <PageHeader
@@ -3994,6 +4381,7 @@ function Administration() {
         title="Administração"
         subtitle="Usuários, regras, destinatários e integração com o ERP."
       />
+      {error && <div className="form-error">{error}</div>}
       <div className="tabs">
         {[
           ["users", "Usuários", Users],
@@ -4017,36 +4405,54 @@ function Administration() {
         ))}
       </div>
       <div className="panel admin-panel">
+        {resourceState[activeResourceKey]?.loading ? (
+          <Loading />
+        ) : resourceState[activeResourceKey]?.error ? (
+          <LoadFailure
+            message={resourceState[activeResourceKey].error}
+            onRetry={() => loadResource(activeResourceKey, true)}
+          />
+        ) : (
+          <>
         {tab === "users" && (
           <>
-            <form className="inline-form" onSubmit={addUser}>
+            <form
+              className="inline-form"
+              key={editingUser?.id || "new-user"}
+              onSubmit={saveUser}
+            >
               <label>
                 Nome
-                <input name="full_name" required />
+                <input name="full_name" defaultValue={editingUser?.full_name || ""} required />
               </label>
               <label>
                 E-mail
-                <input name="email" type="email" required />
+                <input name="email" type="email" defaultValue={editingUser?.email || ""} required />
               </label>
               <label>
                 Perfil
-                <select name="role">
+                <select name="role" defaultValue={editingUser?.role || "viewer"}>
                   <option value="viewer">Visualizador</option>
                   <option value="admin">Administrador</option>
                 </select>
               </label>
               <label>
-                Senha inicial
+                {editingUser ? "Nova senha (opcional)" : "Senha inicial"}
                 <input
                   name="password"
                   type="password"
                   minLength="10"
-                  required
+                  required={!editingUser}
                 />
               </label>
-              <input type="hidden" name="active" value="true" />
-              <button className="primary">
-                <Plus /> Criar usuário
+              {editingUser && (
+                <button type="button" className="ghost" onClick={() => setEditingUser(null)}>
+                  Cancelar
+                </button>
+              )}
+              <button className="primary" disabled={actionBusy}>
+                {editingUser ? <Pencil /> : <Plus />}
+                {editingUser ? "Salvar usuário" : "Criar usuário"}
               </button>
             </form>
             <div className="admin-list">
@@ -4060,6 +4466,36 @@ function Administration() {
                   <Badge status={row.active ? "confirmed" : "overdue"}>
                     {row.role === "admin" ? "Admin" : "Visualizador"}
                   </Badge>
+                  <button
+                    type="button"
+                    className="icon-button"
+                    aria-label={`Editar ${row.full_name}`}
+                    onClick={() => { setError(""); setEditingUser(row); }}
+                  >
+                    <Pencil />
+                  </button>
+                  <button
+                    type="button"
+                    className="icon-button danger"
+                    aria-label={`Inativar ${row.full_name}`}
+                    disabled={actionBusy}
+                    onClick={async () => {
+                      if (!window.confirm(`Inativar ${row.full_name}?`)) return;
+                      setActionBusy(true);
+                      setError("");
+                      try {
+                        await remove(`/admin/users/${row.id}`);
+                        if (editingUser?.id === row.id) setEditingUser(null);
+                        await loadResource("users", true);
+                      } catch (err) {
+                        setError(err.message);
+                      } finally {
+                        setActionBusy(false);
+                      }
+                    }}
+                  >
+                    <X />
+                  </button>
                 </div>
               ))}
             </div>
@@ -4067,17 +4503,27 @@ function Administration() {
         )}
         {tab === "recipients" && (
           <>
-            <form className="inline-form" onSubmit={addRecipient}>
+            <form
+              className="inline-form"
+              key={editingRecipient?.id || "new-recipient"}
+              onSubmit={saveRecipient}
+            >
               <label>
                 Nome
-                <input name="name" required />
+                <input name="name" defaultValue={editingRecipient?.name || ""} required />
               </label>
               <label>
                 E-mail
-                <input name="email" type="email" required />
+                <input name="email" type="email" defaultValue={editingRecipient?.email || ""} required />
               </label>
-              <button className="primary">
-                <Plus /> Adicionar
+              {editingRecipient && (
+                <button type="button" className="ghost" onClick={() => setEditingRecipient(null)}>
+                  Cancelar
+                </button>
+              )}
+              <button className="primary" disabled={actionBusy}>
+                {editingRecipient ? <Pencil /> : <Plus />}
+                {editingRecipient ? "Salvar destinatário" : "Adicionar"}
               </button>
             </form>
             <div className="admin-list">
@@ -4091,11 +4537,31 @@ function Administration() {
                     <span>{row.email}</span>
                   </div>
                   <button
+                    type="button"
+                    className="icon-button"
+                    aria-label={`Editar ${row.name}`}
+                    onClick={() => { setError(""); setEditingRecipient(row); }}
+                  >
+                    <Pencil />
+                  </button>
+                  <button
                     className="icon-button danger"
+                    aria-label={`Remover ${row.name}`}
                     onClick={async () => {
-                      await remove(`/admin/recipients/${row.id}`);
-                      load();
+                      setActionBusy(true);
+                      setError("");
+                      try {
+                        if (!window.confirm(`Remover ${row.name}?`)) return;
+                        await remove(`/admin/recipients/${row.id}`);
+                        if (editingRecipient?.id === row.id) setEditingRecipient(null);
+                        await loadResource("recipients", true);
+                      } catch (err) {
+                        setError(err.message);
+                      } finally {
+                        setActionBusy(false);
+                      }
                     }}
+                    disabled={actionBusy}
                   >
                     <X />
                   </button>
@@ -4108,7 +4574,13 @@ function Administration() {
           <ConfigSection type={tab} rows={data[tab]} reload={load} />
         )}
         {tab === "units" && <UnitSettings rows={data.units} reload={load} />}
-        {tab === "freightRates" && <FreightRatesAdmin rows={data.freightRates} reload={load} />}
+        {tab === "freightRates" && (
+          <FreightRatesAdmin
+            rows={data.freightRates}
+            carrierRows={data.freightCarriers}
+            reload={load}
+          />
+        )}
         {tab === "sync" && (
           <>
             <div className="sync-actions">
@@ -4121,11 +4593,12 @@ function Administration() {
                   </span>
                 </div>
               </div>
-              <button className="secondary" onClick={() => sync("incremental")}>
+              <button className="secondary" disabled={actionBusy} onClick={() => sync("incremental")}>
                 <RefreshCw /> Sincronizar agora
               </button>
               <button
                 className="primary"
+                disabled={actionBusy}
                 onClick={() =>
                   window.confirm(
                     "O backfill completo pode demorar. Continuar?",
@@ -4194,6 +4667,8 @@ function Administration() {
                 error={portalError}
               />
             )}
+          </>
+        )}
           </>
         )}
       </div>
@@ -4327,7 +4802,7 @@ function App() {
           />
           <Route
             path="/rotina-mensal"
-            element={user.role === "admin" ? <MonthlyRoutine user={user} /> : <Navigate to="/" />}
+            element={<MonthlyRoutine user={user} />}
           />
           <Route path="/fretes" element={<Freights user={user} />} />
           <Route

@@ -74,7 +74,7 @@ def _add_purchase_chain(
     db.flush()
 
 
-def test_invoice_discount_rejects_non_contractual_value_in_full():
+def test_invoice_discount_keeps_noncontractual_value_unclassified_before_s10_rule_start():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -87,8 +87,7 @@ def test_invoice_discount_rejects_non_contractual_value_in_full():
         assert any(item["source"] == "unclassified_credit" and item["value"] == 1000.0 for item in evidence)
         s10_rule = db.scalar(select(BonusRule).where(BonusRule.unit_code == "050", BonusRule.kind == "s10_excess_credit"))
         pool = _s10_residual_credit_pool(db, s10_rule, date(2026, 7, 31))
-        assert len(pool) == 1
-        assert pool[0]["remaining"] == Decimal("600.00")
+        assert pool == []
 
 
 def test_invoice_discount_ignores_orphan_6204_and_uses_eligible_product_codes():
@@ -410,7 +409,7 @@ def test_br_umbrella_marks_exact_vibra_receipt_as_automatic_and_auditable():
         assert receipt["before_period_close"] is False
 
 
-def test_unit_004_uses_explicit_portal_credit_without_double_counting_mdcmp():
+def test_unit_004_confirms_direct_portal_usage_without_cycle_inference():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -456,25 +455,32 @@ def test_unit_004_uses_explicit_portal_credit_without_double_counting_mdcmp():
             ]
         )
         db.flush()
+        db.add(
+            PortalBonusMatch(
+                event_id="portal-004-1",
+                status="portal_usage_confirmed",
+                purchase_entry_id=9402,
+                match_basis="NF utilizada declarada pelo portal Ipiranga.",
+                details_json='{"usage_invoice_number":"9402"}',
+                algorithm_version="portal-usage-v1",
+            )
+        )
+        db.flush()
 
         rebuild_reconciliations(db, today=date(2025, 10, 20))
 
         rule = db.scalar(
             select(BonusRule).where(BonusRule.unit_code == "004", BonusRule.kind == "distributor_credit")
         )
-        rows = db.scalars(
-            select(Reconciliation)
-            .where(Reconciliation.rule_id == rule.id, Reconciliation.expected_value > 0)
-            .order_by(Reconciliation.reference_month)
+        items = db.scalars(
+            select(ReconciliationItem).where(ReconciliationItem.item_type == "portal_credit_usage")
         ).all()
-        assert [(row.expected_value, row.observed_value, row.status) for row in rows] == [
-            (Decimal("700.00"), Decimal("700.00"), "confirmed"),
-            (Decimal("700.00"), Decimal("700.00"), "confirmed"),
+        assert [(item.source_document, item.expected_value, item.observed_value, item.status) for item in items] == [
+            ("9402", Decimal("1400.00"), Decimal("1400.00"), "auto_confirmed"),
         ]
-        evidence = json.loads(rows[0].evidence_json)
-        portal = next(item for item in evidence if item.get("source") == "IPIRANGA_PORTAL")
-        assert portal["allocated"] == 700.0
-        assert portal["value"] == 1400.0
+        assert db.scalars(
+            select(ReconciliationItem).where(ReconciliationItem.item_type == "portal_cycle_invoice")
+        ).all() == []
 
 
 def test_probable_match_requires_review_even_when_values_are_equal():

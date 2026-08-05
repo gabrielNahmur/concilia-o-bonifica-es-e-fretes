@@ -142,3 +142,100 @@ def test_partial_credit_before_contractual_deadline_waits_instead_of_requiring_a
         assert waiting["total"] == 1
         assert waiting["items"][0]["action_label"] == "Aguardar extrato Ipiranga"
         assert "crédito postecipado no extrato Ipiranga" in waiting["items"][0]["reason"]
+
+
+def test_work_queue_accepts_multiple_operational_states():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(select(BonusRule).where(BonusRule.unit_code == "005", BonusRule.kind == "invoice_discount"))
+        confirmed = Reconciliation(
+            unit_code="005", rule_id=rule.id, reference_month=date(2026, 6, 1), due_date=date(2026, 6, 30),
+            expected_value=Decimal("100"), observed_value=Decimal("100"), manual_adjustment=Decimal("0"),
+            difference_value=Decimal("0"), status="confirmed", confidence="direct", evidence_json="[]",
+        )
+        waiting = Reconciliation(
+            unit_code="005", rule_id=rule.id, reference_month=date.today().replace(day=1), due_date=date.today() + timedelta(days=7),
+            expected_value=Decimal("80"), observed_value=Decimal("0"), manual_adjustment=Decimal("0"),
+            difference_value=Decimal("80"), status="pending", confidence="none", evidence_json="[]",
+        )
+        db.add_all((confirmed, waiting))
+        db.flush()
+        db.add_all((
+            _invoice_item(confirmed, "NF-CONFIRMED", date(2026, 6, 10), "100"),
+            ReconciliationItem(
+                reconciliation_id=waiting.id, source_key="NF-WAITING", item_type="invoice", source_date=date.today(),
+                source_document="NF-WAITING", description="NF aguardando", expected_value=Decimal("80"),
+                observed_value=Decimal("0"), difference_value=Decimal("80"), status="pending", confidence="none",
+                automatic_eligible=False, review_status="pending", policy_reason="Aguardando baixa.", details_json="{}",
+                fingerprint="NF-WAITING",
+            ),
+        ))
+        db.flush()
+
+        payload = reconciliation_work_queue(
+            db=db, _=None, unit="005", state=["confirmed", "waiting"], scope="all", page=1, page_size=50,
+        )
+
+        assert payload["total"] == 2
+        assert {item["state"] for item in payload["items"]} == {"confirmed", "waiting"}
+
+
+def test_work_queue_004_uses_explicit_portal_credits_not_monthly_inferred_charges():
+    """Unit 004 has an accumulated portal statement, not a monthly credit attribution."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "004",
+                BonusRule.kind == "distributor_credit",
+            )
+        )
+        credited_month = Reconciliation(
+            unit_code="004", rule_id=rule.id, reference_month=date(2026, 4, 1), due_date=date(2026, 5, 31),
+            expected_value=Decimal("7700"), observed_value=Decimal("0"), manual_adjustment=Decimal("0"),
+            difference_value=Decimal("7700"), status="overdue", confidence="none", evidence_json="[]",
+        )
+        awaiting_statement = Reconciliation(
+            unit_code="004", rule_id=rule.id, reference_month=date(2026, 6, 1), due_date=date(2026, 7, 31),
+            expected_value=Decimal("7700"), observed_value=Decimal("0"), manual_adjustment=Decimal("0"),
+            difference_value=Decimal("7700"), status="overdue", confidence="none", evidence_json="[]",
+        )
+        db.add_all((credited_month, awaiting_statement))
+        db.flush()
+        db.add(
+            ReconciliationItem(
+                reconciliation_id=credited_month.id,
+                source_key="portal-usage:004-apr-2026",
+                item_type="portal_credit_usage",
+                source_date=date(2026, 4, 20),
+                source_document="3048889",
+                description="Crédito Ipiranga utilizado na NF 3048889",
+                expected_value=Decimal("8750"),
+                observed_value=Decimal("8750"),
+                difference_value=Decimal("0"),
+                status="auto_confirmed",
+                confidence="direct",
+                automatic_eligible=True,
+                review_status="pending",
+                policy_reason="Crédito declarado no portal.",
+                details_json='{"portal_credit_usage":true}',
+                fingerprint="portal-usage:004-apr-2026",
+            )
+        )
+        db.flush()
+
+        actionable = reconciliation_work_queue(
+            db=db, _=None, unit="004", scope="actionable", page=1, page_size=50,
+        )
+        confirmed = reconciliation_work_queue(
+            db=db, _=None, unit="004", scope="confirmed", page=1, page_size=50,
+        )
+
+        assert actionable["total"] == 0
+        assert [(item["document"], item["status"]) for item in confirmed["items"]] == [
+            ("3048889", "auto_confirmed"),
+        ]

@@ -23,11 +23,12 @@ from pypdf import PdfReader
 from sqlalchemy import select
 
 from app.dependencies import AdminUser, CurrentUser, DbSession
-from app.models import BonusRule, PortalBonusEvent, PortalBonusEventSource, PortalStatementImport, Reconciliation, Unit, User
+from app.models import BonusRule, ManualAdjustment, PortalBonusEvent, PortalBonusEventSource, PortalStatementImport, Purchase, Reconciliation, ReconciliationAllocation, ReconciliationEvidence, ReconciliationItem, Unit, User
 from app.services.audit import audit
 from app.services.ipiranga_portal import MAX_PORTAL_BYTES, PortalStatementError, import_ipiranga_statement
 from app.services.reconciliation import RAIZEN_RECEIPT_CATEGORY, rebuild_reconciliations
-from app.services.rules import money
+from app.services.rules import money, month_end
+from app.services.unit_004_portal_usage import is_unit_004_portal_credit_rule, unit_004_portal_usage_events
 from app.services.uploads import UploadValidationError, read_validated_upload
 
 
@@ -38,6 +39,9 @@ RAIZEN_UNIT = "054"
 RAIZEN_COMPANY = "SHELL"
 RAIZEN_PAYER_CNPJ = "033453598000123"
 RAIZEN_BENEFICIARY_CNPJ = "12564276000262"
+UNIT_004_HISTORICAL_PURCHASE_CUTOFF = date(2026, 5, 26)
+UNIT_004_HISTORICAL_CREDIT_CUTOFF = date(2026, 7, 16)
+UNIT_004_APPROVED_HISTORICAL_RESIDUAL = Decimal("69.99")
 
 RULE_LABELS = {
     "distributor_credit": "Crédito na distribuidora",
@@ -112,6 +116,65 @@ def _filter_months(value) -> list[date]:
     return sorted(months, reverse=True)
 
 
+def _is_historical_exclusion_adjustment(adjustment: ManualAdjustment) -> bool:
+    """Keep an approved exclusion from being presented as received bonus."""
+    reason = unicodedata.normalize("NFKD", adjustment.reason or "")
+    reason = "".join(char for char in reason if not unicodedata.combining(char)).lower()
+    return "exclusao historica" in reason and "fora da conciliacao contratual" in reason
+
+
+def _unit_004_cumulative_snapshot(db: DbSession, rule: BonusRule, as_of: date, today: date) -> dict:
+    """Return the approved accumulated portal-statement view for unit 004."""
+    purchases = db.scalars(
+        select(Purchase).where(
+            Purchase.unit_code == rule.unit_code,
+            Purchase.mapped_company_code == rule.company_code,
+            Purchase.purchase_date >= rule.effective_from,
+            Purchase.purchase_date <= as_of,
+        )
+    ).all()
+    rate = Decimal(rule.rate_per_liter)
+    total_expected = money(sum((Decimal(row.total_liters or 0) * rate for row in purchases), ZERO))
+    historical_expected = money(
+        sum(
+            (
+                Decimal(row.total_liters or 0) * rate
+                for row in purchases
+                if row.purchase_date <= UNIT_004_HISTORICAL_PURCHASE_CUTOFF
+            ),
+            ZERO,
+        )
+    )
+    usage = [entry for entry in unit_004_portal_usage_events(db, rule) if entry.event.portal_date <= today]
+    confirmed_credits = money(sum((Decimal(entry.event.value or 0) for entry in usage), ZERO))
+    historical_credits = money(
+        sum(
+            (
+                Decimal(entry.event.value or 0)
+                for entry in usage
+                if entry.event.portal_date <= UNIT_004_HISTORICAL_CREDIT_CUTOFF
+            ),
+            ZERO,
+        )
+    )
+    historical_residual = money(historical_expected - historical_credits)
+    later_expected = money(max(ZERO, total_expected - historical_expected))
+    later_credits = money(max(ZERO, confirmed_credits - historical_credits))
+    awaiting_statement = money(max(ZERO, later_expected - later_credits))
+    residual_is_approved = abs(historical_residual - UNIT_004_APPROVED_HISTORICAL_RESIDUAL) <= Decimal("0.01")
+    return {
+        "expected": total_expected,
+        "identified": confirmed_credits,
+        "difference": money(total_expected - confirmed_credits),
+        "historical_expected": historical_expected,
+        "historical_identified": historical_credits,
+        "historical_adjustment": historical_residual,
+        "historical_adjustment_approved": residual_is_approved,
+        "next_statement_expected": awaiting_statement,
+        "credit_count": len(usage),
+    }
+
+
 def _normalized(value: str | None) -> str:
     return "".join(
         char for char in unicodedata.normalize("NFKD", value or "").upper() if not unicodedata.combining(char)
@@ -145,6 +208,206 @@ def _source_type(rule: BonusRule) -> str:
     if rule.kind == "bank_deposit" and rule.unit_code == RAIZEN_UNIT:
         return "raizen_receipt"
     return "erp"
+
+
+def _ipiranga_cumulative_card(
+    db: DbSession,
+    *,
+    rule: BonusRule,
+    reference_months: list[date],
+    today: date,
+    unit: Unit | None,
+    imports: list[PortalStatementImport],
+    users: dict[str, User],
+) -> dict:
+    """Build one operational card for an Ipiranga credit wallet.
+
+    The statement is a cumulative source: it does not prove a separate
+    contractual event for every calendar month.  Showing one card per
+    competence made the same imported credit appear several times, which was
+    both noisy and misleading.  The detailed monthly records remain available
+    below the card and in the reconciliation history.
+    """
+    as_of_month = max(reference_months)
+    as_of = min(month_end(as_of_month), today)
+    rows = db.scalars(
+        select(Reconciliation)
+        .where(
+            Reconciliation.rule_id == rule.id,
+            Reconciliation.status != "superseded",
+            Reconciliation.reference_month <= as_of_month,
+        )
+        .order_by(Reconciliation.reference_month)
+    ).all()
+    rows = [row for row in rows if row.status != "not_applicable"]
+    historical_adjustment = ZERO
+    next_statement_expected = ZERO
+
+    if is_unit_004_portal_credit_rule(rule):
+        snapshot = _unit_004_cumulative_snapshot(db, rule, as_of, today)
+        expected = snapshot["expected"]
+        identified = snapshot["identified"]
+        historical_adjustment = (
+            snapshot["historical_adjustment"]
+            if snapshot["historical_adjustment_approved"]
+            else ZERO
+        )
+        next_statement_expected = snapshot["next_statement_expected"]
+        credit_event_count = snapshot["credit_count"]
+        credit_history = [
+            {
+                "date": entry.event.portal_date,
+                "value": float(money(Decimal(entry.event.value or 0))),
+                "document": entry.purchase.invoice_number,
+            }
+            for entry in unit_004_portal_usage_events(db, rule)
+            if entry.event.portal_date <= today
+        ]
+    else:
+        expected = money(sum((Decimal(row.expected_value or 0) for row in rows), ZERO))
+        events = db.scalars(
+            select(PortalBonusEvent)
+            .where(
+                PortalBonusEvent.unit_code == rule.unit_code,
+                PortalBonusEvent.company_code == rule.company_code,
+                PortalBonusEvent.category == "postpaid",
+                PortalBonusEvent.portal_date <= today,
+            )
+            .order_by(PortalBonusEvent.portal_date, PortalBonusEvent.id)
+        ).all()
+        portal_credit_total = money(sum((Decimal(event.value or 0) for event in events), ZERO))
+        reconciliation_ids = [row.id for row in rows]
+        allocated_credit_values = (
+            db.scalars(
+                select(ReconciliationAllocation.allocated_value)
+                .join(ReconciliationEvidence, ReconciliationEvidence.id == ReconciliationAllocation.evidence_id)
+                .join(ReconciliationItem, ReconciliationItem.id == ReconciliationAllocation.item_id)
+                .where(
+                    ReconciliationItem.reconciliation_id.in_(reconciliation_ids),
+                    ReconciliationEvidence.source_type == "IPIRANGA_PORTAL",
+                    ReconciliationEvidence.unit_code == rule.unit_code,
+                    ReconciliationEvidence.counted.is_(True),
+                    ReconciliationEvidence.evidence_date <= today,
+                    ReconciliationAllocation.match_status.in_(("automatic", "accepted")),
+                )
+            ).all()
+            if reconciliation_ids
+            else []
+        )
+        # The portal wallet can retain a credit balance after a credit is split
+        # across contractual competences.  Only the allocated amount proves a
+        # competence; the remaining wallet balance is informational.
+        identified = money(sum((Decimal(value or 0) for value in allocated_credit_values), ZERO))
+        portal_unallocated = money(portal_credit_total - identified)
+        historical_adjustment = money(sum((Decimal(row.manual_adjustment or 0) for row in rows), ZERO))
+        credit_event_count = len(events)
+        credit_history = [
+            {"date": event.portal_date, "value": float(money(Decimal(event.value or 0))), "document": event.reference}
+            for event in events
+        ]
+
+    not_due_expected = money(
+        sum((Decimal(row.expected_value or 0) for row in rows if row.due_date and row.due_date >= today), ZERO)
+    )
+    mature_expected = money(expected - not_due_expected)
+    effective_difference = money(expected - identified - historical_adjustment)
+    mature_difference = money(mature_expected - identified - historical_adjustment)
+    latest_import = max(
+        imports,
+        key=lambda item: (item.period_end or date.min, str(item.created_at or "")),
+        default=None,
+    )
+
+    if expected <= ZERO:
+        situation = "automatic"
+        action = "Nenhuma bonificação liberada no período"
+        description = "A regra permanece acompanhada, mas ainda não há valor contratual acumulado."
+    elif abs(effective_difference) <= Decimal("0.01"):
+        situation = "automatic"
+        action = "Conciliação acumulada concluída"
+        description = "Os créditos postecipados do portal fecham o total calculado pela regra contratual."
+    elif not imports:
+        situation = "awaiting_statement" if identified > ZERO else "awaiting_source"
+        action = "Aguardar próximo extrato" if identified > ZERO else "Importar extrato ou relatório Ipiranga"
+        description = (
+            "Já existem créditos históricos preservados, mas falta o extrato mais recente para atualizar o saldo acumulado."
+            if identified > ZERO
+            else "Ainda não há extrato externo para comprovar os créditos postecipados acumulados."
+        )
+    elif abs(mature_difference) <= Decimal("0.01") and not_due_expected > ZERO:
+        situation = "awaiting_due"
+        action = "Aguardar competência ainda no prazo"
+        description = (
+            f"R$ {not_due_expected:,.2f} permanecem dentro do prazo contratual. "
+            "O total será atualizado pelo próximo extrato, sem gerar cobrança agora."
+        )
+    elif latest_import and latest_import.period_end and latest_import.period_end < as_of:
+        situation = "awaiting_statement"
+        action = "Aguardar próximo extrato"
+        description = (
+            "O último extrato importado não alcança a data atual do acompanhamento. "
+            "Importe a próxima atualização antes de tratar o saldo como divergência."
+        )
+    else:
+        situation = "analysis"
+        action = "Conferir saldo acumulado"
+        description = (
+            "Os créditos do portal e a bonificação calculada ainda não fecham após os ajustes auditados. "
+            "Acompanhe o próximo extrato ou revise o saldo acumulado."
+        )
+
+    adjustment_note = (
+        "Ajuste histórico aprovado, mantido separadamente da prova do portal."
+        if historical_adjustment > ZERO
+        else None
+    )
+    return {
+        "id": f"{rule.id}:cumulative:{as_of_month.isoformat()}",
+        "rule_id": rule.id,
+        "unit_code": rule.unit_code,
+        "unit_name": unit.display_name if unit else f"Unidade {rule.unit_code}",
+        "brand": unit.brand if unit else rule.company_code,
+        "company_code": rule.company_code,
+        "rule_kind": rule.kind,
+        "rule_label": RULE_LABELS.get(rule.kind, rule.kind),
+        "reference_month": as_of_month,
+        "as_of_date": as_of,
+        "due_date": None,
+        "expected_value": float(expected),
+        "observed_value": float(identified),
+        "difference_value": float(effective_difference),
+        "portal_difference_value": float(money(expected - identified)),
+        "portal_credit_total_value": float(portal_credit_total) if not is_unit_004_portal_credit_rule(rule) else float(identified),
+        "portal_unallocated_value": float(portal_unallocated) if not is_unit_004_portal_credit_rule(rule) else 0.0,
+        "historical_adjustment_value": float(historical_adjustment),
+        "next_statement_expected_value": float(next_statement_expected),
+        "credit_event_count": credit_event_count,
+        "credit_history": list(reversed(credit_history[-24:])),
+        "competencies": [
+            {
+                "reference_month": row.reference_month,
+                "due_date": row.due_date,
+                "expected_value": float(money(Decimal(row.expected_value or 0))),
+                "adjustment_value": float(money(Decimal(row.manual_adjustment or 0))),
+            }
+            for row in reversed(rows[-24:])
+        ],
+        "latest_import": _import_payload(latest_import, users) if latest_import else None,
+        "reconciliation_id": None,
+        "confirmation_mode": "automatic" if situation == "automatic" else "none",
+        "source_type": "ipiranga_portal",
+        "source": SOURCE_META["ipiranga_portal"],
+        "situation": situation,
+        "action": action,
+        "description": description,
+        "adjustment_note": adjustment_note,
+        "imports": [_import_payload(row, users) for row in imports[:20]],
+        "queue_url": (
+            f"/conciliacoes?unit={rule.unit_code}&state="
+            f"{'confirmed' if situation == 'automatic' else 'waiting' if situation.startswith('awaiting') else 'actionable'}"
+        ),
+        "cumulative": True,
+    }
 
 
 def _import_payload(row: PortalStatementImport, users: dict[str, User]) -> dict:
@@ -256,8 +519,10 @@ def build_monthly_routine(
     companies: set[str] | None = None,
     source_types: set[str] | None = None,
     situations: set[str] | None = None,
+    today: date | None = None,
 ) -> dict:
     """Build the read-only operational view from the current reconciliation snapshot."""
+    today = today or date.today()
     reference_months = reference_months or [_month_start(date.today())]
     units = units or set()
     companies = companies or set()
@@ -274,14 +539,57 @@ def build_monthly_routine(
         )
     ).all()
     reconciliation_by_key = {(row.rule_id, row.reference_month): row for row in reconciliations}
+    reconciliation_items_by_id: dict[str, list[ReconciliationItem]] = defaultdict(list)
+    reconciliation_ids = [row.id for row in reconciliations]
+    if reconciliation_ids:
+        for item in db.scalars(
+            select(ReconciliationItem).where(ReconciliationItem.reconciliation_id.in_(reconciliation_ids))
+        ).all():
+            reconciliation_items_by_id[item.reconciliation_id].append(item)
+    manual_adjustments_by_reconciliation: dict[str, list[ManualAdjustment]] = defaultdict(list)
+    if reconciliation_ids:
+        for adjustment in db.scalars(
+            select(ManualAdjustment).where(ManualAdjustment.reconciliation_id.in_(reconciliation_ids))
+        ).all():
+            manual_adjustments_by_reconciliation[adjustment.reconciliation_id].append(adjustment)
     imports = db.scalars(select(PortalStatementImport).order_by(PortalStatementImport.created_at.desc())).all()
     imports_by_unit: dict[str, list[PortalStatementImport]] = defaultdict(list)
     for row in imports:
         imports_by_unit[row.unit_code].append(row)
 
     cards: list[dict] = []
+    # Ipiranga credits are a statement wallet, so the operational routine has
+    # exactly one card per unit/rule.  Calendar months stay inside the card's
+    # audit history rather than duplicating its total across the screen.
+    cumulative_rule_ids: set[str] = set()
+    for rule in rules:
+        source_type = _source_type(rule)
+        if source_type != "ipiranga_portal":
+            continue
+        if units and rule.unit_code not in units:
+            continue
+        if companies and rule.company_code not in companies:
+            continue
+        if source_types and source_type not in source_types:
+            continue
+        card = _ipiranga_cumulative_card(
+            db,
+            rule=rule,
+            reference_months=reference_months,
+            today=today,
+            unit=unit_rows.get(rule.unit_code),
+            imports=imports_by_unit[rule.unit_code],
+            users=users,
+        )
+        cumulative_rule_ids.add(rule.id)
+        if situations and card["situation"] not in situations:
+            continue
+        cards.append(card)
+
     for reference_month in reference_months:
         for rule in rules:
+            if rule.id in cumulative_rule_ids:
+                continue
             if units and rule.unit_code not in units:
                 continue
             if companies and rule.company_code not in companies:
@@ -289,16 +597,112 @@ def build_monthly_routine(
             source_type = _source_type(rule)
             if source_types and source_type not in source_types:
                 continue
+            if is_unit_004_portal_credit_rule(rule) and unit_004_portal_usage_events(db, rule):
+                as_of = min(month_end(reference_month), today)
+                snapshot = _unit_004_cumulative_snapshot(db, rule, as_of, today)
+                if snapshot["next_statement_expected"] > ZERO:
+                    situation = "awaiting_statement"
+                    action = "Aguardar próximo extrato"
+                    description = (
+                        f"Créditos confirmados no extrato Ipiranga: R$ {snapshot['identified']:,.2f}. "
+                        f"R$ {snapshot['next_statement_expected']:,.2f} das compras posteriores ao corte histórico "
+                        "aguardam o próximo extrato; isso não é cobrança por NF."
+                    )
+                elif snapshot["historical_adjustment_approved"]:
+                    situation = "automatic"
+                    action = "Conciliação acumulada concluída"
+                    description = (
+                        "O total de créditos Ipiranga foi conferido contra a bonificação calculada por volume. "
+                        "O ajuste histórico de R$ 69,99 permanece apenas como acompanhamento auditável."
+                    )
+                else:
+                    situation = "analysis"
+                    action = "Conferir saldo acumulado"
+                    description = (
+                        "Os créditos do portal foram somados, mas o saldo histórico ainda não corresponde ao ajuste "
+                        "aprovado de R$ 69,99. Importe o extrato que faltar antes de tratar como diferença."
+                    )
+                if situations and situation not in situations:
+                    continue
+                unit = unit_rows.get(rule.unit_code)
+                cards.append(
+                    {
+                        "id": f"{rule.id}:accumulated:{reference_month.isoformat()}",
+                        "rule_id": rule.id,
+                        "unit_code": rule.unit_code,
+                        "unit_name": unit.display_name if unit else f"Unidade {rule.unit_code}",
+                        "brand": unit.brand if unit else rule.company_code,
+                        "company_code": rule.company_code,
+                        "rule_kind": rule.kind,
+                        "rule_label": RULE_LABELS.get(rule.kind, rule.kind),
+                        "reference_month": reference_month,
+                        "due_date": None,
+                        "expected_value": float(snapshot["expected"]),
+                        "observed_value": float(snapshot["identified"]),
+                        "difference_value": float(snapshot["difference"]),
+                        "historical_expected_value": float(snapshot["historical_expected"]),
+                        "historical_identified_value": float(snapshot["historical_identified"]),
+                        "historical_adjustment_value": float(snapshot["historical_adjustment"]),
+                        "next_statement_expected_value": float(snapshot["next_statement_expected"]),
+                        "credit_count": snapshot["credit_count"],
+                        "reconciliation_id": None,
+                        "confirmation_mode": "automatic" if situation == "automatic" else "none",
+                        "source_type": source_type,
+                        "source": SOURCE_META[source_type],
+                        "situation": situation,
+                        "action": action,
+                        "description": description,
+                        "imports": [_import_payload(row, users) for row in imports_by_unit[rule.unit_code][:20]],
+                        "queue_url": "/conciliacoes?unit=004&state=confirmed",
+                    }
+                )
+                continue
             reconciliation = reconciliation_by_key.get((rule.id, reference_month))
+            if reconciliation and reconciliation.status == "not_applicable":
+                # Contractual exclusions retain their audit trail, but they
+                # must not resurface as a monthly operational card.
+                continue
             expected = money(Decimal(reconciliation.expected_value)) if reconciliation else ZERO
-            observed = (
-                money(Decimal(reconciliation.observed_value) + Decimal(reconciliation.manual_adjustment or 0))
+            historical_exclusion_value = money(
+                sum(
+                    (
+                        Decimal(adjustment.amount or 0)
+                        for adjustment in manual_adjustments_by_reconciliation.get(reconciliation.id, [])
+                        if _is_historical_exclusion_adjustment(adjustment)
+                    ),
+                    ZERO,
+                )
+            ) if reconciliation else ZERO
+            effective_adjustment = (
+                money(Decimal(reconciliation.manual_adjustment or 0) - historical_exclusion_value)
                 if reconciliation
                 else ZERO
             )
-            difference = money(Decimal(reconciliation.difference_value)) if reconciliation else ZERO
-            confirmed = bool(reconciliation and reconciliation.status in {"confirmed", "auto_confirmed", "manual_confirmed"})
+            observed = (
+                money(Decimal(reconciliation.observed_value) + effective_adjustment)
+                if reconciliation
+                else ZERO
+            )
+            difference = money(expected - observed) if reconciliation else ZERO
+            confirmed = bool(
+                reconciliation
+                and (
+                    reconciliation.status in {"confirmed", "auto_confirmed", "manual_confirmed"}
+                    or (historical_exclusion_value > ZERO and abs(difference) <= Decimal("0.01"))
+                )
+            )
             covered_imports = [row for row in imports_by_unit[rule.unit_code] if _covers_month(row, reference_month)]
+            invoice_items = reconciliation_items_by_id.get(reconciliation.id, []) if reconciliation else []
+            # A remaining value with only unpaid titles cannot be charged or
+            # treated as a missing benefit until the ERP settles the title.
+            only_waiting_invoice_settlements = (
+                rule.kind == "invoice_discount"
+                and reconciliation is not None
+                and reconciliation.status == "pending"
+                and bool(invoice_items)
+                and any(item.status == "pending" for item in invoice_items)
+                and all(item.status in {"pending", "confirmed", "auto_confirmed", "manual_confirmed"} for item in invoice_items)
+            )
             if expected <= ZERO:
                 situation = "automatic"
                 action = "Nenhuma bonificação liberada nesta competência"
@@ -307,10 +711,54 @@ def build_monthly_routine(
                 situation = "automatic"
                 action = "Conferência concluída"
                 description = "O valor esperado foi fechado por evidência exata e a trilha foi preservada."
+            elif only_waiting_invoice_settlements:
+                situation = "awaiting_settlement"
+                action = "Aguardar baixa"
+                description = (
+                    "As demais notas da competência já foram conciliadas. O valor restante pertence a "
+                    "título(s) ainda sem baixa no ERP e não representa cobrança até a liquidação."
+                )
+            elif (
+                source_type == "ipiranga_portal"
+                and reconciliation
+                and reconciliation.status == "pending"
+                and "unassigned_portal_credit" in (reconciliation.evidence_json or "")
+            ):
+                situation = "awaiting_competence"
+                action = "Aguardar identificação da competência"
+                description = (
+                    "O extrato lista um crédito, mas não informa a competência. "
+                    "A prova foi preservada sem apropriação automática; acompanhe a identificação da Ipiranga."
+                )
+            elif (
+                source_type == "ipiranga_portal"
+                and reconciliation
+                and reconciliation.status == "pending"
+                and reconciliation.due_date < today
+                and covered_imports
+            ):
+                situation = "awaiting_portal_credit"
+                action = "Aguardar crédito no portal"
+                description = (
+                    "O extrato já foi importado, mas ainda não traz um crédito que possa ser "
+                    "vinculado com segurança a esta competência. Acompanhe a próxima atualização do portal Ipiranga."
+                )
             elif source_type != "erp" and not covered_imports:
                 situation = "awaiting_source"
                 action = f"Importar {SOURCE_META[source_type]['label']}"
                 description = SOURCE_META[source_type]["description"]
+            elif reconciliation and reconciliation.due_date >= today and observed <= ZERO:
+                # A prior file can cover the competence without containing the
+                # credit itself yet.  Before the contractual deadline that is
+                # expected timing, not an item that needs investigation.
+                situation = "awaiting_due"
+                action = "Aguardar vencimento e próxima atualização"
+                description = (
+                    "A competência ainda não venceu. O arquivo já importado não traz um crédito "
+                    "para este mês; acompanhe a próxima atualização antes de tratar como diferença."
+                    if source_type != "erp" and covered_imports
+                    else "A competência ainda não venceu e não há valor identificado. Aguarde o vencimento ou a próxima baixa do ERP."
+                )
             else:
                 situation = "analysis"
                 action = "Conferir vínculo e acompanhar"
@@ -345,11 +793,14 @@ def build_monthly_routine(
                     "action": action,
                     "description": description,
                     "imports": [_import_payload(row, users) for row in covered_imports],
-                    "queue_url": f"/conciliacoes?unit={rule.unit_code}&reference_month={reference_month.isoformat()}&scope=all",
+                    "queue_url": (
+                        f"/conciliacoes?unit={rule.unit_code}&reference_month={reference_month.isoformat()}"
+                        f"&state={'confirmed' if situation == 'automatic' else 'waiting' if situation in {'awaiting_source', 'awaiting_due', 'awaiting_settlement', 'awaiting_competence', 'awaiting_portal_credit', 'awaiting_statement'} else 'actionable'}"
+                    ),
                 }
             )
 
-    order = {"awaiting_source": 0, "analysis": 1, "automatic": 2}
+    order = {"awaiting_source": 0, "awaiting_due": 1, "awaiting_settlement": 2, "awaiting_competence": 3, "awaiting_portal_credit": 4, "awaiting_statement": 5, "analysis": 6, "automatic": 7}
     cards.sort(key=lambda row: (-date.fromisoformat(str(row["reference_month"])).toordinal(), order[row["situation"]], row["unit_code"], row["rule_kind"]))
     raizen_events = db.scalars(
         select(PortalBonusEvent)
@@ -373,6 +824,11 @@ def build_monthly_routine(
         "summary": {
             "automatic": sum(row["situation"] == "automatic" for row in cards),
             "awaiting_source": sum(row["situation"] == "awaiting_source" for row in cards),
+            "awaiting_due": sum(row["situation"] == "awaiting_due" for row in cards),
+            "awaiting_settlement": sum(row["situation"] == "awaiting_settlement" for row in cards),
+            "awaiting_competence": sum(row["situation"] == "awaiting_competence" for row in cards),
+            "awaiting_portal_credit": sum(row["situation"] == "awaiting_portal_credit" for row in cards),
+            "awaiting_statement": sum(row["situation"] == "awaiting_statement" for row in cards),
             "analysis": sum(row["situation"] == "analysis" for row in cards),
             "expected_value": float(sum((Decimal(str(row["expected_value"])) for row in cards), ZERO)),
             "open_value": float(sum((abs(Decimal(str(row["difference_value"]))) for row in cards if row["situation"] != "automatic"), ZERO)),

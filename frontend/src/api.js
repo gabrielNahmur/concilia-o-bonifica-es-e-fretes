@@ -12,7 +12,24 @@ export async function api(path, options = {}) {
   }
   if (!response.ok) {
     let detail = `Erro ${response.status}`;
-    try { detail = (await response.json()).detail || detail; } catch { /* empty */ }
+    try {
+      const payload = await response.json();
+      const rawDetail = payload.detail;
+      if (typeof rawDetail === 'string') {
+        detail = rawDetail;
+      } else if (Array.isArray(rawDetail)) {
+        detail = rawDetail
+          .map((item) => {
+            if (typeof item === 'string') return item;
+            const field = Array.isArray(item?.loc) ? item.loc.slice(1).join('.') : '';
+            return [field, item?.msg].filter(Boolean).join(': ');
+          })
+          .filter(Boolean)
+          .join('; ') || detail;
+      } else if (rawDetail && typeof rawDetail === 'object') {
+        detail = rawDetail.message || JSON.stringify(rawDetail);
+      }
+    } catch { /* empty */ }
     throw new Error(detail);
   }
   const contentType = response.headers.get('content-type') || '';

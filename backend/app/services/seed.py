@@ -1,7 +1,7 @@
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import case, or_, select
 from sqlalchemy.orm import Session
 
 from app.models import BonusRule, Company, Contract, FreightRate, SupplierAlias, Unit
@@ -81,9 +81,9 @@ RULES = [
     # 15/05/2026 e quitada com Nota PrÃ³pria no portal em 18/05. Antes disso o
     # portal nÃ£o mostra a rotina regular de desconto.
     ("050", "TEXACO", "invoice_discount", date(2026, 5, 15), "0.04", None, None, None, None, None, 0, "all_fuel"),
-    # O adicional de S10 permanece em monitoramento, mas nÃ£o deve retroagir
-    # ao perÃ­odo sem qualquer rotina comprovada de bonificaÃ§Ã£o no portal.
-    ("050", "TEXACO", "s10_excess_credit", date(2026, 5, 15), "0.10", "150000", None, None, None, None, 1, "s10"),
+    # O adicional S10 foi confirmado pela diretoria a partir de agosto/2026;
+    # nÃ£o pode criar pendÃªncia retroativa nos meses anteriores.
+    ("050", "TEXACO", "s10_excess_credit", date(2026, 8, 1), "0.10", "150000", None, None, None, None, 1, "s10"),
     ("054", "SHELL", "bank_deposit", date(2024, 12, 1), "0.05", None, None, None, None, 20, 1, "all_fuel"),
 ]
 
@@ -191,7 +191,7 @@ def seed_reference_data(db: Session) -> None:
         )
     )
     if rule_050_s10:
-        rule_050_s10.effective_from = date(2026, 5, 15)
+        rule_050_s10.effective_from = date(2026, 8, 1)
 
     # Instalações já existentes foram criadas antes de a bonificação da 008
     # ter sido confirmada. Mantemos o ajuste idempotente para que um backfill
@@ -295,8 +295,18 @@ def map_supplier(db: Session, unit_code: str, cnpj: str | None, legal_name: str 
     normalized_cnpj = "".join(character for character in (cnpj or "") if character.isdigit())
     aliases = db.scalars(
         select(SupplierAlias)
-        .where(SupplierAlias.active.is_(True), SupplierAlias.unit_code == unit_code)
-        .order_by(SupplierAlias.effective_from.desc())
+        .where(
+            SupplierAlias.active.is_(True),
+            or_(
+                SupplierAlias.unit_code == unit_code,
+                SupplierAlias.unit_code.is_(None),
+            ),
+        )
+        .order_by(
+            case((SupplierAlias.unit_code == unit_code, 0), else_=1),
+            SupplierAlias.effective_from.desc(),
+            SupplierAlias.id.desc(),
+        )
     ).all()
     upper_name = (legal_name or "").upper()
     for alias in aliases:

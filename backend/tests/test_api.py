@@ -2,7 +2,7 @@ from fastapi.testclient import TestClient
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app.database import Base, SessionLocal, engine
 from app.main import app
@@ -210,7 +210,20 @@ def test_admin_confirmation_creates_immutable_review_snapshot():
                     expected_value=Decimal("100"), observed_value=Decimal("100"), manual_adjustment=Decimal("0"),
                     difference_value=Decimal("0"), status="pending", confidence="direct", evidence_json="[]",
                 )
-                db.add(row); db.commit()
+                db.add(row)
+                db.flush()
+            else:
+                row.expected_value = Decimal("100")
+                row.observed_value = Decimal("100")
+                row.manual_adjustment = Decimal("0")
+                row.difference_value = Decimal("0")
+                row.status = "pending"
+                row.confidence = "direct"
+                row.evidence_json = "[]"
+            db.execute(
+                delete(ReconciliationReview).where(ReconciliationReview.reconciliation_id == row.id)
+            )
+            db.commit()
             row_id = row.id
         login = client.post("/api/auth/login", json={"email": "review.admin@gbi.com", "password": "SenhaSegura123!"})
         assert login.status_code == 200
@@ -319,6 +332,218 @@ def test_admin_can_review_an_exact_item_from_exception_queue():
             refreshed = db.get(Reconciliation, row_id)
             assert refreshed.status == "confirmed"
             assert refreshed.confirmation_mode == "manual"
+
+
+def test_all_administrative_reconciliation_actions_persist_an_audited_decision():
+    """The four actions exposed in the drawer must execute through the real API."""
+    Base.metadata.create_all(engine)
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            seed_reference_data(db)
+            admin = db.scalar(select(User).where(User.email == "actions.admin@gbi.com"))
+            if not admin:
+                admin = User(
+                    email="actions.admin@gbi.com",
+                    full_name="Admin de Ações",
+                    role="admin",
+                    active=True,
+                    must_change_password=False,
+                    password_hash=hash_password("SenhaSegura123!"),
+                )
+                db.add(admin)
+            rule = db.scalar(
+                select(BonusRule).where(BonusRule.unit_code == "005", BonusRule.kind == "invoice_discount")
+            )
+
+            def pending_row(reference_month: date) -> Reconciliation:
+                row = Reconciliation(
+                    unit_code="005", rule_id=rule.id, reference_month=reference_month,
+                    due_date=date(2041, 12, 31), expected_value=Decimal("100"),
+                    observed_value=Decimal("0"), manual_adjustment=Decimal("0"),
+                    difference_value=Decimal("100"), status="pending", confidence="none", evidence_json="[]",
+                )
+                db.add(row)
+                db.flush()
+                db.add(
+                    ReconciliationItem(
+                        reconciliation_id=row.id,
+                        item_type="invoice",
+                        source_key=f"actions:{reference_month.isoformat()}",
+                        source_date=reference_month,
+                        source_document=f"NF-{reference_month.month}",
+                        description="Item para validar ação administrativa",
+                        expected_value=Decimal("100"), observed_value=Decimal("0"),
+                        difference_value=Decimal("100"), status="pending", confidence="none",
+                        automatic_eligible=False, review_status="pending",
+                        policy_reason="Aguardando decisão administrativa.", details_json="{}",
+                        fingerprint=f"actions-{reference_month.month}" * 8,
+                    )
+                )
+                db.flush()
+                return row
+
+            request_info = pending_row(date(2041, 1, 1))
+            reject = pending_row(date(2041, 2, 1))
+            adjustment = Reconciliation(
+                unit_code="005", rule_id=rule.id, reference_month=date(2041, 3, 1),
+                due_date=date(2041, 12, 31), expected_value=Decimal("100"),
+                observed_value=Decimal("0"), manual_adjustment=Decimal("0"),
+                difference_value=Decimal("100"), status="pending", confidence="none", evidence_json="[]",
+            )
+            confirmation = Reconciliation(
+                unit_code="005", rule_id=rule.id, reference_month=date(2041, 4, 1),
+                due_date=date(2041, 12, 31), expected_value=Decimal("100"),
+                observed_value=Decimal("100"), manual_adjustment=Decimal("0"),
+                difference_value=Decimal("0"), status="pending", confidence="direct", evidence_json="[]",
+            )
+            db.add_all((adjustment, confirmation))
+            db.commit()
+            ids = {
+                "request_info_item": db.scalar(select(ReconciliationItem.id).where(ReconciliationItem.reconciliation_id == request_info.id)),
+                "reject_item": db.scalar(select(ReconciliationItem.id).where(ReconciliationItem.reconciliation_id == reject.id)),
+                "adjustment": adjustment.id,
+                "confirmation": confirmation.id,
+            }
+
+        assert client.post(
+            "/api/auth/login", json={"email": "actions.admin@gbi.com", "password": "SenhaSegura123!"},
+        ).status_code == 200
+        assert client.post(
+            f"/api/reconciliations/items/{ids['request_info_item']}/review",
+            json={"action": "needs_information", "reason_code": "boleto_pendente", "notes": "Solicitar o boleto e o comprovante ao financeiro."},
+        ).status_code == 200
+        assert client.post(
+            f"/api/reconciliations/items/{ids['reject_item']}/review",
+            json={"action": "reject", "reason_code": "vinculo_invalido", "notes": "O documento não pertence à competência conferida."},
+        ).status_code == 200
+        adjusted = client.post(
+            f"/api/reconciliations/{ids['adjustment']}/adjust",
+            json={"amount": "100.00", "reason": "Ajuste gerencial de teste para validar a trilha auditável."},
+        )
+        assert adjusted.status_code == 200
+        assert adjusted.json()["difference_value"] == 0.0
+        confirmed = client.post(
+            f"/api/reconciliations/{ids['confirmation']}/confirm",
+            json={"notes": "Competência de teste confirmada pelo gestor."},
+        )
+        assert confirmed.status_code == 200
+        assert confirmed.json()["confirmation_mode"] == "manual"
+
+        with SessionLocal() as db:
+            assert db.get(ReconciliationItem, ids["request_info_item"]).review_status == "needs_information"
+            assert db.get(ReconciliationItem, ids["reject_item"]).review_status == "rejected"
+            assert db.get(Reconciliation, ids["adjustment"]).manual_adjustment == Decimal("100.00")
+            assert db.get(Reconciliation, ids["confirmation"]).status == "confirmed"
+            actions = db.scalars(
+                select(ReconciliationReview.action).where(
+                    ReconciliationReview.reconciliation_id.in_((ids["adjustment"], ids["confirmation"]))
+                )
+            ).all()
+            assert {"adjust", "confirm"}.issubset(actions)
+
+
+def test_information_request_can_be_answered_without_closing_the_financial_difference():
+    """A resposta interna encerra somente a solicitação, nunca a cobrança."""
+    Base.metadata.create_all(engine)
+    with TestClient(app) as client:
+        with SessionLocal() as db:
+            seed_reference_data(db)
+            requester = db.scalar(select(User).where(User.email == "requester.info@gbi.com"))
+            if not requester:
+                requester = User(
+                    email="requester.info@gbi.com",
+                    full_name="Gestor Solicitante",
+                    role="admin",
+                    active=True,
+                    must_change_password=False,
+                    password_hash=hash_password("SenhaSegura123!"),
+                )
+                db.add(requester)
+            responder = db.scalar(select(User).where(User.email == "responder.info@gbi.com"))
+            if not responder:
+                responder = User(
+                    email="responder.info@gbi.com",
+                    full_name="Gestora Respondente",
+                    role="admin",
+                    active=True,
+                    must_change_password=False,
+                    password_hash=hash_password("SenhaSegura123!"),
+                )
+                db.add(responder)
+            rule = db.scalar(
+                select(BonusRule).where(BonusRule.unit_code == "005", BonusRule.kind == "invoice_discount")
+            )
+            row = Reconciliation(
+                unit_code="005", rule_id=rule.id, reference_month=date(2042, 1, 1),
+                due_date=date(2042, 1, 31), expected_value=Decimal("600"),
+                observed_value=Decimal("0"), manual_adjustment=Decimal("0"),
+                difference_value=Decimal("600"), status="pending", confidence="none", evidence_json="[]",
+            )
+            db.add(row)
+            db.flush()
+            item = ReconciliationItem(
+                reconciliation_id=row.id,
+                item_type="invoice",
+                source_key="request-response-2042-01",
+                source_date=date(2042, 1, 10),
+                source_document="NF-2042",
+                description="Item com pedido interno de informação",
+                expected_value=Decimal("600"), observed_value=Decimal("0"),
+                difference_value=Decimal("600"), status="pending", confidence="none",
+                automatic_eligible=False, review_status="pending",
+                policy_reason="Aguardando confirmação financeira.", details_json="{}",
+                fingerprint="request-response-2042-01" * 4,
+            )
+            db.add(item)
+            db.flush()
+            db.add(
+                ReconciliationException(
+                    reconciliation_id=row.id,
+                    item_id=item.id,
+                    source_key="request-response-2042-01:paid_without_discount",
+                    exception_type="paid_without_discount",
+                    severity="critical",
+                    status="open",
+                    title="Título pago sem desconto esperado",
+                    description="A cobrança financeira continua em aberto.",
+                    expected_value=Decimal("600"), observed_value=Decimal("0"), difference_value=Decimal("600"),
+                )
+            )
+            db.commit()
+            item_id = item.id
+
+        assert client.post(
+            "/api/auth/login", json={"email": "requester.info@gbi.com", "password": "SenhaSegura123!"},
+        ).status_code == 200
+        opened = client.post(
+            f"/api/reconciliations/items/{item_id}/review",
+            json={
+                "action": "needs_information",
+                "reason_code": "boleto_pendente",
+                "notes": "Confirmar com o financeiro se o desconto foi aplicado.",
+            },
+        )
+        assert opened.status_code == 200
+        request = opened.json()["information_requests"][0]
+        assert request["status"] == "open"
+        assert request["requested_by"] == "Gestor Solicitante"
+
+        assert client.post(
+            "/api/auth/login", json={"email": "responder.info@gbi.com", "password": "SenhaSegura123!"},
+        ).status_code == 200
+        answered = client.post(
+            f"/api/reconciliations/information-requests/{request['id']}/respond",
+            json={"notes": "Financeiro confirmou que o boleto não recebeu o desconto."},
+        )
+        assert answered.status_code == 200
+        detail = answered.json()
+        closed_request = detail["information_requests"][0]
+        assert closed_request["status"] == "closed"
+        assert closed_request["response"] == "Financeiro confirmou que o boleto não recebeu o desconto."
+        assert closed_request["responded_by"] == "Gestora Respondente"
+        assert detail["difference_value"] == 600.0
+        assert detail["workspace"]["items"][0]["review_status"] == "pending"
+        assert detail["workspace"]["exceptions"][0]["status"] == "open"
 
 
 def test_admin_can_classify_ipiranga_supplemental_event():

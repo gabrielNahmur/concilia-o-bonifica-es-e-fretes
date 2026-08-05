@@ -13,6 +13,7 @@ from app.models import (
     BankEntry,
     BonusRule,
     FinancialEntry,
+    ManualAdjustment,
     PayableDocument,
     PayableMovement,
     PortalBonusEvent,
@@ -31,6 +32,10 @@ from app.services.rules import (
     month_end,
     month_start,
     reconciliation_status,
+)
+from app.services.management_adjustments import (
+    full_management_adjustment,
+    full_management_adjustment_evidence,
 )
 
 
@@ -73,17 +78,15 @@ def _eligible_liters(purchase: Purchase, rule: BonusRule) -> Decimal:
 def invoice_discount_forfeited_by_late_payment(
     rule: BonusRule, documents: list[PayableDocument]
 ) -> bool:
-    """Return whether the proven late settlement voids the 050 invoice credit.
+    """Return whether a proven late Texaco settlement voids its invoice credit.
 
-    The Texaco portal statement for unit 050 has one direct example: NF
-    3085121 was settled four days after its due date and received no Nota
-    PrÃ³pria, while the surrounding on-time titles did.  The exception is kept
-    narrow to this documented commercial condition; it never affects other
-    units or bonus modalities.
+    The portal/ERP evidence shows the same commercial condition in the Texaco
+    units: titles settled after their due date receive no contractual discount.
+    This never applies to other suppliers or bonus modalities, and requires one
+    uniquely linked paid title with both dates available.
     """
     if not (
-        rule.unit_code == "050"
-        and rule.company_code == "TEXACO"
+        rule.company_code == "TEXACO"
         and rule.kind == "invoice_discount"
         and len(documents) == 1
     ):
@@ -703,6 +706,122 @@ def _portal_credit_pool(db: Session, rule: BonusRule, until: date) -> list[dict]
     return pool
 
 
+def _unit_004_unique_portal_cycle_allocations(
+    db: Session, rule: BonusRule, until: date
+) -> dict[int, list[dict]]:
+    """Return only unique, chronological portal-credit cycles for unit 004.
+
+    The Ipiranga statement for unit 004 identifies the issued credit and its
+    date, but not the competence or invoice numbers.  Its values nevertheless
+    follow the contractual R$0.07/L exactly.  The approved rule therefore
+    treats a credit as primary proof only when there is *one* contiguous group
+    of contractual purchase NFs, between this credit and the preceding portal
+    credit, whose litres reproduce the issued amount (one-cent rounding is
+    allowed).  Ambiguous or non-matching events remain unallocated.
+    """
+    if not (
+        rule.unit_code == "004"
+        and rule.company_code == "IPIRANGA"
+        and rule.kind == "distributor_credit"
+    ):
+        return {}
+
+    purchases = db.scalars(
+        select(Purchase)
+        .options(selectinload(Purchase.items))
+        .where(
+            Purchase.unit_code == rule.unit_code,
+            Purchase.mapped_company_code == rule.company_code,
+            Purchase.purchase_date >= rule.effective_from,
+            Purchase.purchase_date <= until,
+        )
+        .order_by(Purchase.purchase_date, Purchase.erp_entry_id)
+    ).all()
+    events = db.scalars(
+        select(PortalBonusEvent)
+        .where(
+            PortalBonusEvent.unit_code == rule.unit_code,
+            PortalBonusEvent.company_code == rule.company_code,
+            PortalBonusEvent.category == "postpaid",
+            PortalBonusEvent.portal_date <= until,
+        )
+        .order_by(PortalBonusEvent.portal_date, PortalBonusEvent.id)
+    ).all()
+    allocations: dict[int, list[dict]] = defaultdict(list)
+    previous_credit_date = rule.effective_from - timedelta(days=1)
+    rate = Decimal(rule.rate_per_liter)
+
+    for event in events:
+        window = [
+            purchase
+            for purchase in purchases
+            if previous_credit_date <= purchase.purchase_date <= event.portal_date
+        ]
+        candidates: list[tuple[list[Purchase], Decimal, Decimal]] = []
+        for start_index in range(len(window)):
+            liters = ZERO
+            for end_index in range(start_index, len(window)):
+                purchase = window[end_index]
+                liters += _eligible_liters(purchase, rule)
+                expected_value = money(liters * rate)
+                if abs(expected_value - money(event.value)) <= Decimal("0.01"):
+                    candidates.append((window[start_index:end_index + 1], liters, expected_value))
+                    break
+                if expected_value > money(event.value) + Decimal("0.01"):
+                    break
+
+        # The next portal event starts a new observed cycle regardless of
+        # whether this one was deterministically assignable.  This protects
+        # against using an older ambiguous credit to fabricate a later match.
+        previous_credit_date = event.portal_date
+        if len(candidates) != 1:
+            continue
+
+        cycle_purchases, cycle_liters, calculated_value = candidates[0]
+        invoice_numbers = [
+            str(purchase.invoice_number or purchase.erp_entry_id)
+            for purchase in cycle_purchases
+        ]
+        cycle_start = cycle_purchases[0].purchase_date
+        cycle_end = cycle_purchases[-1].purchase_date
+        for purchase in cycle_purchases:
+            allocated = money(_eligible_liters(purchase, rule) * rate)
+            if allocated <= ZERO:
+                continue
+            allocations[purchase.erp_entry_id].append(
+                {
+                    "source": "IPIRANGA_PORTAL_CYCLE",
+                    "id": event.id,
+                    "date": event.portal_date.isoformat(),
+                    "value": float(money(event.value)),
+                    "source_value": float(money(event.value)),
+                    "allocated": float(allocated),
+                    "document": None,
+                    "company_code": "IPIRANGA",
+                    "purchase_entry_id": purchase.erp_entry_id,
+                    "invoice_number": purchase.invoice_number,
+                    "portal_event_key": event.event_key,
+                    "portal_cycle_match_status": "unique_contiguous_nf_cycle",
+                    "portal_cycle_exact": True,
+                    "cycle_start": cycle_start.isoformat(),
+                    "cycle_end": cycle_end.isoformat(),
+                    "cycle_liters": float(cycle_liters),
+                    "cycle_purchase_count": len(cycle_purchases),
+                    "cycle_invoices": invoice_numbers,
+                    "cycle_credit_value": float(money(event.value)),
+                    "cycle_calculated_value": float(calculated_value),
+                    "match_basis": (
+                        "Ciclo Ipiranga único: NFs contínuas de "
+                        f"{cycle_start.strftime('%d/%m/%Y')} a {cycle_end.strftime('%d/%m/%Y')} "
+                        f"somam {cycle_liters:,.3f} L x R$ {rate:.6f}/L = "
+                        f"R$ {calculated_value:,.2f}; crédito do portal em "
+                        f"{event.portal_date.strftime('%d/%m/%Y')} = R$ {money(event.value):,.2f}."
+                    ),
+                }
+            )
+    return allocations
+
+
 def _s10_residual_credit_pool(db: Session, rule: BonusRule, until: date) -> list[dict]:
     """Expose residual credits after the base discount for the S10 rule."""
     purchases = db.scalars(
@@ -788,6 +907,110 @@ def _consume_fifo_windowed(
             }
         )
     return money(observed), evidence
+
+
+def _reserve_exact_postpaid_portal_credits(
+    pool: list[dict], month_specs: list[dict], rule: BonusRule
+) -> dict[date, tuple[Decimal, list[dict]]]:
+    """Reserve unambiguous portal credits for the preceding competence.
+
+    Units 003 and 004 receive Ipiranga credit postpaid. A portal credit issued
+    in the following calendar month with the exact expected value is stronger
+    than a generic chronological-wallet allocation. Reserve it before the
+    remaining balance is consumed by FIFO, otherwise an older open competence
+    could split the evidence and hide the direct competence -> credit link.
+    """
+    if not (
+        rule.kind == "distributor_credit"
+        and rule.unit_code in {"003", "004"}
+        and rule.company_code == "IPIRANGA"
+    ):
+        return {}
+
+    reservations: dict[date, tuple[Decimal, list[dict]]] = {}
+    for spec in month_specs:
+        expected = money(spec["expected"])
+        if expected <= ZERO:
+            continue
+        available_from = add_months(month_start(spec["reference_month"]), 1)
+        candidates = [
+            item
+            for item in pool
+            if item["remaining"] > ZERO
+            and item["date"] >= available_from
+            and item["date"] <= spec["due"]
+            and money(item["remaining"]) == expected
+        ]
+        if len(candidates) != 1:
+            continue
+        item = candidates[0]
+        item["remaining"] -= expected
+        reservations[spec["reference_month"]] = (
+            expected,
+            [
+                {
+                    "source": item.get("source") or "IPIRANGA_PORTAL",
+                    "id": item["id"],
+                    "date": item["date"].isoformat(),
+                    "document": item["document"],
+                    "allocated": float(expected),
+                    "after_due_date": False,
+                    "allocation_reason": (
+                        "Crédito postecipado de valor exato atribuído à competência "
+                        "do mês anterior, dentro da janela contratual."
+                    ),
+                    "value": float(money(item.get("raw_value", expected))),
+                    "corroborated_by_6204": item.get("corroborated_by_6204"),
+                    "mlanf_id": item.get("mlanf_id"),
+                    "portal_event_key": item.get("portal_event_key"),
+                    "match_status": item.get("portal_match_status"),
+                    "chain_exact": item.get("chain_exact"),
+                    "invoice_number": item.get("invoice_number"),
+                    "purchase_entry_id": item.get("purchase_entry_id"),
+                    "financial_entry_id": item.get("financial_entry_id"),
+                    "match_basis": item.get("match_basis"),
+                }
+            ],
+        )
+    return reservations
+
+
+def _unassigned_portal_credit_evidence(
+    pool: list[dict], available_from: date, due: date
+) -> list[dict]:
+    """Expose portal credits without assigning them to a competence.
+
+    Unit 004's statement contains the credit amount and issue date but not the
+    competence it settles.  A generic FIFO allocation is useful for exploring
+    a ledger, but is not documentary proof.  These records therefore remain
+    visible as an unassigned portal balance and never compose ``observed``.
+    """
+    evidence: list[dict] = []
+    for item in pool:
+        if item["remaining"] <= ZERO or not (available_from <= item["date"] <= due):
+            continue
+        evidence.append(
+            {
+                "source": "unassigned_portal_credit",
+                "id": item["id"],
+                "date": item["date"].isoformat(),
+                "document": item.get("document"),
+                "value": float(money(item.get("raw_value", item["remaining"]))),
+                "source_value": float(money(item.get("raw_value", item["remaining"]))),
+                "counted": False,
+                "portal_event_key": item.get("portal_event_key"),
+                "portal_match_status": item.get("portal_match_status"),
+                "invoice_number": item.get("invoice_number"),
+                "purchase_entry_id": item.get("purchase_entry_id"),
+                "match_basis": item.get("match_basis"),
+                "reason": (
+                    "Crédito postecipado listado no extrato Ipiranga dentro da janela "
+                    "da competência, preservado sem apropriação automática porque o "
+                    "portal não informa qual competência ele liquida."
+                ),
+            }
+        )
+    return evidence
 
 
 def _consume_exact_credit_windowed(
@@ -1190,6 +1413,16 @@ def _upsert(
 def _rebuild_monthly_rule(db: Session, rule: BonusRule, today: date) -> int:
     count = 0
     months = list(_months(rule.effective_from, min(today, rule.effective_to or today)))
+    # Unit 004 uses the accumulated portal statement as primary proof.  The
+    # source names the NF where a credit was used, but does not say which
+    # purchase generated it; never create an inferred purchase-cycle match.
+    unit_004_cycle_allocations: dict[int, list[dict]] = {}
+    use_unit_004_nf_cycles = False
+    is_unit_004_portal_credit = (
+        rule.unit_code == "004"
+        and rule.company_code == "IPIRANGA"
+        and rule.kind == "distributor_credit"
+    )
     if rule.kind == "distributor_credit":
         portal_pool = (
             _portal_credit_pool(db, rule, today)
@@ -1199,31 +1432,73 @@ def _rebuild_monthly_rule(db: Session, rule: BonusRule, today: date) -> int:
         # Unidade 003: a prova aprovada é exclusivamente a emissão do crédito
         # no extrato Ipiranga. Descontos MDCMP continuam no ERP para auditoria,
         # mas não podem confirmar nem complementar a bonificação contratual.
-        pool = portal_pool if (
-            rule.unit_code == "003" and rule.company_code == "IPIRANGA"
-        ) else portal_pool or _contract_credit_pool(db, rule, today)
+        portal_primary = rule.company_code == "IPIRANGA" and rule.unit_code in {"003", "004"}
+        pool = portal_pool if portal_primary else portal_pool or _contract_credit_pool(db, rule, today)
     elif rule.kind == "s10_excess_credit":
         pool = _s10_residual_credit_pool(db, rule, today)
     else:
         pool = []
-    used_evidence: set[str] = set()
+    month_specs = []
     for reference_month in months:
         total_liters, s10_liters, entry_ids = _purchase_totals(db, rule, reference_month)
         if rule.kind == "s10_excess_credit":
             expected = max(ZERO, s10_liters - Decimal(rule.threshold_liters or 0)) * Decimal(rule.rate_per_liter)
         else:
             expected = total_liters * Decimal(rule.rate_per_liter)
-        expected = money(expected)
-        due = due_date_for_month(reference_month, rule.due_month_offset, rule.due_day)
+        month_specs.append(
+            {
+                "reference_month": reference_month,
+                "total_liters": total_liters,
+                "s10_liters": s10_liters,
+                "entry_ids": entry_ids,
+                "expected": money(expected),
+                "due": due_date_for_month(reference_month, rule.due_month_offset, rule.due_day),
+            }
+        )
+    exact_portal_reservations = _reserve_exact_postpaid_portal_credits(pool, month_specs, rule)
+    used_evidence: set[str] = set()
+    for spec in month_specs:
+        reference_month = spec["reference_month"]
+        total_liters = spec["total_liters"]
+        s10_liters = spec["s10_liters"]
+        entry_ids = spec["entry_ids"]
+        expected = spec["expected"]
+        due = spec["due"]
         if rule.kind == "invoice_discount":
             observed, evidence = _document_discounts_capped(db, rule, entry_ids)
             confidence = "direct" if observed > ZERO and any(item.get("source") == "MDCMP" for item in evidence) else "none"
         elif rule.kind == "distributor_credit":
-            available_from = (
-                add_months(month_start(reference_month), 1)
-                if rule.kind == "s10_excess_credit" else month_start(reference_month)
-            )
-            observed, evidence = _consume_fifo_windowed(pool, expected, due, available_from)
+            if is_unit_004_portal_credit:
+                observed = ZERO
+                evidence = []
+            elif use_unit_004_nf_cycles:
+                evidence = [
+                    payload
+                    for entry_id in entry_ids
+                    for payload in unit_004_cycle_allocations.get(entry_id, [])
+                ]
+                observed = money(sum(
+                    (Decimal(str(payload.get("allocated") or 0)) for payload in evidence),
+                    ZERO,
+                ))
+            else:
+                observed = ZERO
+                evidence = []
+            available_from = month_start(reference_month)
+            if not is_unit_004_portal_credit and not use_unit_004_nf_cycles and reference_month in exact_portal_reservations:
+                observed, evidence = exact_portal_reservations[reference_month]
+            elif not is_unit_004_portal_credit and not use_unit_004_nf_cycles and rule.company_code == "IPIRANGA" and rule.unit_code in {"003", "004"}:
+                # The unit 004 portal report does not identify a competence.
+                # Keep its credits auditable, but do not close historical
+                # months using a chronological wallet hypothesis.
+                observed = ZERO
+                evidence = _unassigned_portal_credit_evidence(
+                    pool,
+                    add_months(month_start(reference_month), 1),
+                    due,
+                )
+            elif not use_unit_004_nf_cycles:
+                observed, evidence = _consume_fifo_windowed(pool, expected, due, available_from)
             # O crédito permanece auditável. Quando a origem inteira tem o
             # mesmo valor da competência, a política do workspace o confirma.
             confidence = "direct" if observed > ZERO and evidence else "none"
@@ -1305,17 +1580,33 @@ def _rebuild_ipiranga_portal_rule(db: Session, rule: BonusRule, today: date) -> 
     active_months = set()
     for cycle in ledger["cycles"]:
         active_months.add(cycle["reference_month"])
-        _upsert(
+        existing = db.scalar(
+            select(Reconciliation).where(
+                Reconciliation.rule_id == rule.id,
+                Reconciliation.reference_month == cycle["reference_month"],
+            )
+        )
+        adjustment = full_management_adjustment(db, existing) if existing else None
+        row = _upsert(
             db,
             rule,
             cycle["reference_month"],
             cycle["due_date"],
             cycle["expected"],
-            cycle["observed"],
-            cycle["confidence"],
-            cycle["evidence"],
+            ZERO if adjustment else cycle["observed"],
+            "none" if adjustment else cycle["confidence"],
+            [full_management_adjustment_evidence(existing, adjustment)] if adjustment else cycle["evidence"],
             today,
         )
+        if adjustment:
+            row.status = "confirmed"
+            row.confirmation_mode = "manual"
+            row.confirmed_at = row.confirmed_at or adjustment.created_at
+            row.confirmed_by = row.confirmed_by or adjustment.created_by
+            row.notes = (
+                "Competência encerrada por ajuste gerencial histórico integral; "
+                "não representa crédito emitido pela Ipiranga ou identificado no ERP."
+            )
     stale = db.scalars(
         select(Reconciliation).where(
             Reconciliation.rule_id == rule.id,

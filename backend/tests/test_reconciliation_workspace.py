@@ -9,8 +9,11 @@ from app.database import Base
 from app.models import (
     BonusRule,
     FinancialEntry,
+    ManualAdjustment,
     PayableDocument,
     PayableMovement,
+    PortalBonusEvent,
+    PortalBonusMatch,
     Purchase,
     PurchaseItem,
     Reconciliation,
@@ -19,14 +22,26 @@ from app.models import (
     ReconciliationException,
     ReconciliationItem,
 )
-from app.services.reconciliation import _document_discounts_capped, invoice_discount_forfeited_by_late_payment
+from app.services.reconciliation import (
+    _document_discounts_capped,
+    _unit_004_unique_portal_cycle_allocations,
+    invoice_discount_forfeited_by_late_payment,
+    rebuild_reconciliations,
+)
 from app.services.reconciliation_workspace import (
     CONTRACTUAL_EXCLUSION_REVIEW_STATUS,
+    _base_item_payloads,
     _automatic_policy,
     _item_status,
     rebuild_reconciliation_workspace,
 )
 from app.services.seed import seed_reference_data
+from app.scripts.apply_unit_001_feb_2025_management_adjustment import (
+    apply_unit_001_feb_2025_management_adjustment,
+)
+from app.scripts.apply_unit_001_mar_2025_management_adjustment import (
+    apply_unit_001_mar_2025_management_adjustment,
+)
 
 
 def _invoice_chain(db: Session, with_exact_6204: bool = True):
@@ -139,7 +154,7 @@ def _invoice_chain(db: Session, with_exact_6204: bool = True):
     db.flush()
 
 
-def test_unit_050_late_payment_forfeits_only_its_invoice_discount():
+def test_late_payment_forfeits_texaco_invoice_discount_only():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -148,6 +163,18 @@ def test_unit_050_late_payment_forfeits_only_its_invoice_discount():
             select(BonusRule).where(
                 BonusRule.unit_code == "050",
                 BonusRule.kind == "invoice_discount",
+            )
+        )
+        other_texaco_rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "014",
+                BonusRule.kind == "invoice_discount",
+            )
+        )
+        ipiranga_credit_rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "004",
+                BonusRule.kind == "distributor_credit",
             )
         )
         late = PayableDocument(
@@ -159,7 +186,32 @@ def test_unit_050_late_payment_forfeits_only_its_invoice_discount():
             due_date=date(2026, 7, 10), payment_date=date(2026, 7, 10), balance=Decimal("0"),
         )
         assert invoice_discount_forfeited_by_late_payment(rule, [late])
+        assert invoice_discount_forfeited_by_late_payment(other_texaco_rule, [late])
         assert not invoice_discount_forfeited_by_late_payment(rule, [on_time])
+        assert not invoice_discount_forfeited_by_late_payment(ipiranga_credit_rule, [late])
+
+
+def test_late_payment_item_is_a_non_chargeable_historical_status():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "014",
+                BonusRule.kind == "invoice_discount",
+            )
+        )
+        payload = {"details": {"lost_due_to_late_payment": True, "late_payment_days": 4}}
+        assert _item_status(
+            rule,
+            payload,
+            Decimal("0"),
+            Decimal("0"),
+            date(2026, 4, 23),
+            date(2026, 5, 1),
+            automatic=False,
+        ) == "late_payment"
 
 
 def _reconciliation_from_chain(db: Session):
@@ -413,7 +465,7 @@ def test_historical_contractual_exclusion_survives_a_source_fingerprint_change()
         assert row.status == "not_applicable"
 
 
-def test_unpaid_invoice_waits_for_its_own_title_due_date():
+def test_unpaid_invoice_stays_waiting_even_after_its_title_due_date():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -430,6 +482,12 @@ def test_unpaid_invoice_waits_for_its_own_title_due_date():
         row = _reconciliation_from_chain(db)
         rebuild_reconciliation_workspace(db, date(2026, 7, 10))
         item = db.scalar(select(ReconciliationItem).where(ReconciliationItem.reconciliation_id == row.id))
+        assert item.status == "pending"
+        assert row.status == "pending"
+
+        rebuild_reconciliation_workspace(db, date(2026, 7, 21))
+        db.refresh(item)
+        db.refresh(row)
         assert item.status == "pending"
         assert row.status == "pending"
 
@@ -658,3 +716,321 @@ def test_non_umbrella_credit_ignores_legacy_br_calculation_evidence():
                 ReconciliationEvidence.source_type == "calculation",
             )
         ) is None
+
+
+def test_unit_004_unassigned_portal_credit_waits_for_competence_not_overdue():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "004",
+                BonusRule.kind == "distributor_credit",
+            )
+        )
+        payload = {
+            "expected": Decimal("7700"),
+            "evidence": [
+                {
+                    "source": "unassigned_portal_credit",
+                    "id": "portal-004-7350",
+                    "date": "2026-07-16",
+                    "value": Decimal("7350"),
+                    "counted": False,
+                }
+            ],
+        }
+
+        automatic, reason = _automatic_policy(rule, payload, Decimal("0"))
+        status = _item_status(
+            rule,
+            payload,
+            Decimal("7700"),
+            Decimal("0"),
+            date(2026, 7, 31),
+            date(2026, 8, 4),
+            automatic,
+        )
+
+        assert automatic is False
+        assert "competencia" in reason.lower()
+        assert status == "pending"
+
+
+def _unit_004_purchase(entry_id: int, invoice: str, purchased_on: date, liters: str) -> Purchase:
+    return Purchase(
+        erp_entry_id=entry_id,
+        unit_code="004",
+        supplier_person_id=4,
+        supplier_name="IPIRANGA PRODUTOS DE PETROLEO SA",
+        supplier_cnpj="33337122015906",
+        mapped_company_code="IPIRANGA",
+        invoice_number=invoice,
+        purchase_date=purchased_on,
+        total_liters=Decimal(liters),
+        s10_liters=Decimal("0"),
+        gross_value=Decimal("0"),
+        net_value=Decimal("0"),
+    )
+
+
+def test_unit_004_does_not_materialize_an_inferred_portal_cycle_per_nf():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "004",
+                BonusRule.kind == "distributor_credit",
+            )
+        )
+        # 50k + 75k L = R$8,750 at the contractual R$0.07/L.  This is the
+        # sole contiguous group before the 18 Nov. portal credit.
+        db.add_all(
+            [
+                _unit_004_purchase(40001, "40001", date(2025, 10, 21), "50000"),
+                _unit_004_purchase(40002, "40002", date(2025, 11, 17), "75000"),
+                # The next portal window contains two possible 125k groups,
+                # so it must stay unassigned rather than choosing one.
+                _unit_004_purchase(40003, "40003", date(2025, 12, 1), "50000"),
+                _unit_004_purchase(40004, "40004", date(2025, 12, 5), "75000"),
+                _unit_004_purchase(40005, "40005", date(2025, 12, 10), "50000"),
+            ]
+        )
+        db.add_all(
+            [
+                PortalBonusEvent(
+                    id="portal-004-unique",
+                    event_key="portal-004-unique",
+                    unit_code="004",
+                    company_code="IPIRANGA",
+                    category="postpaid",
+                    portal_date=date(2025, 11, 18),
+                    value=Decimal("8750"),
+                ),
+                PortalBonusEvent(
+                    id="portal-004-ambiguous",
+                    event_key="portal-004-ambiguous",
+                    unit_code="004",
+                    company_code="IPIRANGA",
+                    category="postpaid",
+                    portal_date=date(2025, 12, 20),
+                    value=Decimal("8750"),
+                ),
+            ]
+        )
+        db.flush()
+
+        allocations = _unit_004_unique_portal_cycle_allocations(db, rule, date(2025, 12, 20))
+        assert set(allocations) == {40001, 40002}
+        assert sum(Decimal(str(item["allocated"])) for item in allocations[40001] + allocations[40002]) == Decimal("8750.00")
+        assert all(item["portal_cycle_exact"] is True for values in allocations.values() for item in values)
+
+        rebuild_reconciliations(db, date(2025, 12, 20), commit=False)
+        confirmed = db.scalars(
+            select(ReconciliationItem).where(
+                ReconciliationItem.source_document.in_(("40001", "40002"))
+            )
+        ).all()
+        assert confirmed == []
+        assert all(item.status == "auto_confirmed" for item in confirmed)
+        assert all("ciclo único" in item.policy_reason.lower() for item in confirmed)
+        ambiguous = db.scalars(
+            select(ReconciliationItem).where(
+                ReconciliationItem.source_document.in_(("40003", "40004", "40005"))
+            )
+        ).all()
+        assert all(item.status != "auto_confirmed" for item in ambiguous)
+
+
+def test_unit_004_materializes_portal_credit_not_each_purchase_nf():
+    """The portal proves the credit used, not an inferred origin purchase cycle."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        db.add_all(
+            [
+                _unit_004_purchase(40001, "40001", date(2025, 10, 21), "50000"),
+                _unit_004_purchase(40002, "40002", date(2025, 11, 17), "75000"),
+            ]
+        )
+        event = PortalBonusEvent(
+            id="portal-004-direct-usage",
+            event_key="portal-004-direct-usage",
+            unit_code="004",
+            company_code="IPIRANGA",
+            category="postpaid",
+            portal_date=date(2025, 11, 18),
+            value=Decimal("8750.00"),
+        )
+        db.add(event)
+        db.flush()
+        db.add(
+            PortalBonusMatch(
+                event_id=event.id,
+                status="portal_usage_confirmed",
+                purchase_entry_id=40002,
+                match_basis="Portal informa NF utilizada e valor exato do crédito.",
+                details_json='{"usage_invoice_number":"40002"}',
+                algorithm_version="portal-usage-v1",
+            )
+        )
+        db.flush()
+
+        rebuild_reconciliations(db, date(2025, 11, 20), commit=False)
+
+        items = db.scalars(
+            select(ReconciliationItem).where(ReconciliationItem.source_document.in_(("40001", "40002")))
+        ).all()
+        assert [(item.item_type, item.source_document, item.expected_value, item.observed_value) for item in items] == [
+            ("portal_credit_usage", "40002", Decimal("8750.00"), Decimal("8750.00")),
+        ]
+        assert items[0].status == "auto_confirmed"
+
+
+def test_full_management_adjustment_hides_rejected_automatic_evidence_from_workspace():
+    """A full historical management adjustment is not a portal-credit proof."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "001",
+                BonusRule.kind == "distributor_credit",
+            )
+        )
+        row = Reconciliation(
+            unit_code="001",
+            rule_id=rule.id,
+            reference_month=date(2025, 2, 1),
+            due_date=date(2025, 3, 31),
+            expected_value=Decimal("9570.00"),
+            observed_value=Decimal("1044.02"),
+            manual_adjustment=Decimal("9570.00"),
+            difference_value=Decimal("0.00"),
+            status="confirmed",
+            confidence="none",
+            confirmation_mode="manual",
+            evidence_json="[]",
+        )
+        db.add(row)
+        db.flush()
+        db.add(
+            ManualAdjustment(
+                reconciliation_id=row.id,
+                amount=Decimal("1044.02"),
+                reason=(
+                    "[historical_full_adjustment] Regularização integral aprovada pela gestão; "
+                    "não representa crédito do portal ou ERP."
+                ),
+                created_by="admin",
+            )
+        )
+        db.flush()
+
+        assert _base_item_payloads(db, row, rule) == []
+
+
+def test_unit_001_historical_adjustment_promotes_the_manual_balance_to_the_full_expected_value():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "001",
+                BonusRule.kind == "distributor_credit",
+            )
+        )
+        row = Reconciliation(
+            unit_code="001",
+            rule_id=rule.id,
+            reference_month=date(2025, 2, 1),
+            due_date=date(2025, 3, 31),
+            expected_value=Decimal("9570.00"),
+            observed_value=Decimal("1044.02"),
+            manual_adjustment=Decimal("8525.98"),
+            difference_value=Decimal("0.00"),
+            status="confirmed",
+            confidence="direct",
+            confirmation_mode="manual",
+            evidence_json="[]",
+        )
+        db.add(row)
+        db.flush()
+        db.add(
+            ManualAdjustment(
+                reconciliation_id=row.id,
+                amount=Decimal("8525.98"),
+                reason="Regularização inicial aprovada pela gestão.",
+                created_by="admin",
+            )
+        )
+        db.flush()
+
+        result = apply_unit_001_feb_2025_management_adjustment(db, rebuild=False)
+
+        assert result == {"added": Decimal("1044.02"), "total_adjustment": Decimal("9570.00")}
+        assert row.observed_value == Decimal("0.00")
+        assert row.manual_adjustment == Decimal("9570.00")
+        assert row.difference_value == Decimal("0.00")
+        assert db.scalar(
+            select(ManualAdjustment).where(
+                ManualAdjustment.reconciliation_id == row.id,
+                ManualAdjustment.reason.startswith("[historical_full_adjustment]"),
+            )
+        )
+
+
+def test_unit_001_march_full_historical_adjustment_replaces_stale_calculation_evidence():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "001",
+                BonusRule.kind == "distributor_credit",
+            )
+        )
+        row = Reconciliation(
+            unit_code="001",
+            rule_id=rule.id,
+            reference_month=date(2025, 3, 1),
+            due_date=date(2025, 4, 30),
+            expected_value=Decimal("10005.00"),
+            observed_value=Decimal("0.00"),
+            manual_adjustment=Decimal("10005.00"),
+            difference_value=Decimal("0.00"),
+            status="confirmed",
+            confidence="none",
+            confirmation_mode="manual",
+            evidence_json=json.dumps([{"source": "calculation", "value": 0}]),
+        )
+        db.add(row)
+        db.flush()
+        db.add(
+            ManualAdjustment(
+                reconciliation_id=row.id,
+                amount=Decimal("10005.00"),
+                reason="Regularização inicial aprovada pela gestão.",
+                created_by="admin",
+            )
+        )
+        db.flush()
+
+        result = apply_unit_001_mar_2025_management_adjustment(db, rebuild=False)
+
+        assert result == {"added": Decimal("0.00"), "total_adjustment": Decimal("10005.00")}
+        marker = db.scalar(
+            select(ManualAdjustment).where(
+                ManualAdjustment.reconciliation_id == row.id,
+                ManualAdjustment.reason.startswith("[historical_full_adjustment]"),
+            )
+        )
+        assert marker.amount == Decimal("0.00")
+        assert _base_item_payloads(db, row, rule) == []

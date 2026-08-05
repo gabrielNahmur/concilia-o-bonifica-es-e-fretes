@@ -39,6 +39,7 @@ from app.services.reconciliation import (
 from app.services.reconciliation_workspace import _automatic_policy
 from app.services.rules import add_months, money
 from app.services.seed import seed_reference_data
+from app.scripts.apply_unit_004_portal_usage_evidence import apply_unit_004_portal_usage_evidence
 
 
 class FakeCell:
@@ -338,6 +339,93 @@ def test_contract_parcel_credit_is_confirmed_as_issued_not_unmatched():
         match = db.scalar(select(PortalBonusMatch).where(PortalBonusMatch.event_id == event.id))
         assert match.status == "issued"
         assert "Crédito emitido explicitamente" in match.match_basis
+
+
+def test_ipiranga_matcher_preserves_unit_004_portal_usage_confirmation():
+    """A direct portal detail must not be replaced by an ERP proximity guess."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        event = PortalBonusEvent(
+            id="unit-004-usage",
+            unit_code="004",
+            company_code="IPIRANGA",
+            category=POSTPAID_CATEGORY,
+            portal_date=date(2026, 1, 16),
+            value=Decimal("10360.01"),
+            description="BonificaÃ§Ã£o Postecipada",
+            event_key="unit-004-usage-key",
+        )
+        db.add(event)
+        db.flush()
+        db.add(
+            PortalBonusMatch(
+                event_id=event.id,
+                status="portal_usage_confirmed",
+                purchase_entry_id=900090260,
+                match_basis="Detalhe do portal informa a NF utilizada.",
+                details_json='{"usage_invoice_number":"3008303"}',
+                algorithm_version=ALGORITHM_VERSION,
+            )
+        )
+        db.commit()
+
+        assert match_ipiranga_events(db, "004") == 1
+
+        match = db.scalar(select(PortalBonusMatch).where(PortalBonusMatch.event_id == event.id))
+        assert match.status == "portal_usage_confirmed"
+        assert match.purchase_entry_id == 900090260
+
+
+def test_unit_004_portal_usage_evidence_registers_the_explicit_used_invoice():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        purchase = Purchase(
+            erp_entry_id=900090260,
+            unit_code="004",
+            supplier_name="IPIRANGA PRODUTOS DE PETROLEO SA",
+            supplier_cnpj="33337122015906",
+            mapped_company_code="IPIRANGA",
+            invoice_number="3008303",
+            access_key="43260133337122015906550030030083031951343959",
+            purchase_date=date(2026, 1, 13),
+            total_liters=Decimal("20000"),
+            s10_liters=Decimal("0"),
+            gross_value=Decimal("108650.00"),
+            net_value=Decimal("108650.00"),
+        )
+        event = PortalBonusEvent(
+            id="usage-004-jan",
+            event_key="usage-004-jan",
+            unit_code="004",
+            company_code="IPIRANGA",
+            category="postpaid",
+            portal_date=date(2026, 1, 16),
+            value=Decimal("10360.01"),
+        )
+        db.add_all([purchase, event])
+        db.flush()
+
+        result = apply_unit_004_portal_usage_evidence(
+            db,
+            evidence_rows=[
+                {
+                    "portal_date": date(2026, 1, 16),
+                    "credit_value": Decimal("10360.01"),
+                    "purchase_entry_id": 900090260,
+                    "invoice_number": "3008303",
+                    "gross_value": Decimal("108650.00"),
+                    "access_key": "43260133337122015906550030030083031951343959",
+                }
+            ],
+        )
+
+        match = db.scalar(select(PortalBonusMatch).where(PortalBonusMatch.event_id == event.id))
+        assert result["linked"] == 1
+        assert match.status == "portal_usage_confirmed"
+        assert match.purchase_entry_id == purchase.erp_entry_id
+        assert json.loads(match.details_json)["usage_invoice_number"] == "3008303"
 
 
 def _add_exact_chain(

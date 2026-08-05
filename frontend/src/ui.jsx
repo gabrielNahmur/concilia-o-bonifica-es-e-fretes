@@ -43,6 +43,7 @@ export const statusMeta = {
   auto_confirmed: ["Confirmada", "green"], manual_confirmed: ["Confirmada", "green"],
   review_required: ["Revisão necessária", "yellow"], data_gap: ["Lacuna de dados", "yellow"],
   needs_information: ["Aguardando informação", "yellow"], partial: ["Parcial", "yellow"],
+  late_payment: ["Pago com atraso", "yellow"],
   divergent: ["Divergente", "red"], overdue: ["Vencida", "red"], sent: ["Enviado", "blue"],
   delivered: ["Entregue", "green"], delivery_delayed: ["Entrega atrasada", "yellow"],
   bounced: ["Devolvido", "red"], complained: ["Marcado como spam", "red"],

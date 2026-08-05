@@ -1466,6 +1466,11 @@ def match_ipiranga_events(
         # Ipiranga declara que o crédito daquele ciclo foi criado. O consumo
         # pode ocorrer meses depois e em mais de um título, logo a janela de
         # um dia usada para uma cadeia NF/título não é aplicável aqui.
+        existing_match = db.scalar(
+            select(PortalBonusMatch).where(PortalBonusMatch.event_id == event.id)
+        )
+        if event.unit_code == "004" and existing_match and existing_match.status == "portal_usage_confirmed":
+            continue
         if event.business_classification == "postpaid_issued":
             match = _portal_match(db, event.id)
             match.status = "issued"

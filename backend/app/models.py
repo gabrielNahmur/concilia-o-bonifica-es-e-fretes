@@ -437,6 +437,34 @@ class ReconciliationReview(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
 
 
+class ReconciliationInformationRequest(Base):
+    """Internal question linked to one reconciliation item and its auditable response."""
+
+    __tablename__ = "reconciliation_information_requests"
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=lambda: str(uuid4()))
+    reconciliation_id: Mapped[str] = mapped_column(
+        ForeignKey("reconciliations.id", ondelete="CASCADE"), index=True
+    )
+    item_id: Mapped[str] = mapped_column(
+        ForeignKey("reconciliation_items.id", ondelete="CASCADE"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="open", index=True)
+    reason_code: Mapped[str] = mapped_column(String(50))
+    request_notes: Mapped[str] = mapped_column(Text)
+    requested_by: Mapped[str] = mapped_column(String(36), index=True)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    response_notes: Mapped[str | None] = mapped_column(Text)
+    responded_by: Mapped[str | None] = mapped_column(String(36), index=True)
+    responded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    closed_by: Mapped[str | None] = mapped_column(String(36), index=True)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+    __table_args__ = (
+        Index("ix_reconciliation_information_request_item_status", "item_id", "status"),
+    )
+
+
 class PortalStatementImport(Base):
     """Arquivo original do portal armazenado somente no banco da aplicação."""
 

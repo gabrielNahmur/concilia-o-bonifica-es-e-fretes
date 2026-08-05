@@ -121,16 +121,23 @@ def test_detail_builds_exact_note_title_financial_chain():
             identity_json=json.dumps({"source": "MDCMP", "id": "D:5001", "date": "2026-06-20", "document": "BOL123", "value": 600, "corroborated_by_6204": True}),
             fingerprint="selected-evidence",
         )
+        supplemental_evidence = ReconciliationEvidence(
+            source_type="UNCLASSIFIED_CREDIT", source_key="credit:5001", evidence_date=date(2026, 6, 20),
+            unit_code="005", document_id="UNRELATED", value=Decimal("123"), counted=False,
+            identity_json=json.dumps({"source": "UNCLASSIFIED_CREDIT", "id": "credit:5001", "date": "2026-06-20", "document": "UNRELATED", "value": 123}),
+            fingerprint="supplemental-evidence",
+        )
         other_evidence = ReconciliationEvidence(
             source_type="MDCMP", source_key="D:other", evidence_date=date(2026, 6, 21),
             unit_code="005", document_id="OTHER", value=Decimal("400"), counted=True,
             identity_json=json.dumps({"source": "MDCMP", "id": "D:other", "date": "2026-06-21", "document": "OTHER", "value": 400}),
             fingerprint="other-evidence",
         )
-        db.add_all((selected_evidence, other_evidence))
+        db.add_all((selected_evidence, supplemental_evidence, other_evidence))
         db.flush()
         db.add_all((
             ReconciliationAllocation(item_id=selected_item.id, evidence_id=selected_evidence.id, allocated_value=Decimal("600"), match_status="automatic", confidence="direct", match_basis="Título da NF 1234", algorithm_version="test"),
+            ReconciliationAllocation(item_id=selected_item.id, evidence_id=supplemental_evidence.id, allocated_value=Decimal("0"), match_status="proposed", confidence="none", match_basis="Vínculo auxiliar sem valor alocado", algorithm_version="test"),
             ReconciliationAllocation(item_id=other_item.id, evidence_id=other_evidence.id, allocated_value=Decimal("400"), match_status="automatic", confidence="direct", match_basis="Título da NF 9999", algorithm_version="test"),
         ))
         db.add_all([
@@ -173,6 +180,7 @@ def test_detail_builds_exact_note_title_financial_chain():
         scoped_item = next(item for item in detail["workspace"]["items"] if item["source_document"] == "1234")
         assert [item["document"] for item in scoped_item["display_evidence"]] == ["BOL123"]
         assert scoped_item["display_evidence"][0]["value"] == 600.0
+        assert len(scoped_item["allocations"]) == 2
         assert "Cd_Entrada" in detail["erp_order_note"]
         assert [item["title"] for item in detail["workspace"]["exceptions"]] == ["Pendência ativa"]
         assert detail["workspace"]["summary"]["open_exceptions"] == 1
@@ -197,6 +205,33 @@ def test_distributor_credit_calls_native_discount_credit_utilization():
 
     assert display["label"] == "Crédito utilizado na distribuidora"
     assert "utilização do crédito" in display["match_basis"]
+
+
+def test_unit_004_portal_usage_evidence_explains_that_the_nf_used_the_credit():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        rule = BonusRule(unit_code="004", company_code="IPIRANGA", kind="distributor_credit")
+        display = _enrich_evidence(
+            db,
+            [{
+                "source": "IPIRANGA_PORTAL_USAGE",
+                "id": "portal-004-jan",
+                "date": "2026-01-16",
+                "document": "3008303",
+                "value": 10360.01,
+                "allocated": 10360.01,
+                "purchase_entry_id": 900090260,
+                "access_key": "43260133337122015906550030030083031951343959",
+                "match_basis": "Detalhe do portal Ipiranga declara a Nota Fiscal Utilizada.",
+            }],
+            rule,
+        )[0]
+
+    assert display["kind"] == "portal"
+    assert display["label"] == "Crédito postecipado usado no portal Ipiranga"
+    assert "NF 3008303" in display["history"]
+    assert "não identifica a compra que gerou" in display["history"]
 
 
 def test_portal_evidence_card_shows_only_the_current_invoice_share():
