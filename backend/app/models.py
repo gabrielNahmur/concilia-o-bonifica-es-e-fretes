@@ -655,6 +655,21 @@ class FreightCteInvoice(Base):
     )
 
 
+class FreightOrigin(Base):
+    """Cached registered location of a resolved NF-e supplier."""
+
+    __tablename__ = "freight_origins"
+    cnpj: Mapped[str] = mapped_column(String(14), primary_key=True)
+    legal_name: Mapped[str | None] = mapped_column(String(200))
+    city: Mapped[str | None] = mapped_column(String(100))
+    state: Mapped[str | None] = mapped_column(String(2))
+    source: Mapped[str | None] = mapped_column(String(40))
+    last_lookup_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_error: Mapped[str | None] = mapped_column(Text)
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class FreightRate(Base):
     """Independent, effective-dated freight price reference."""
 
