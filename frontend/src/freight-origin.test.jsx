@@ -43,6 +43,19 @@ it("shows the registered city in the CT-e origin facts", () => {
   expect(screen.getByText("Origem cadastral: Canoas/RS")).toBeInTheDocument();
 });
 
+it("uses the resolved supplier name when the CT-e sender is blank", () => {
+  render(
+    <FreightOriginFacts
+      senderName={null}
+      senderCnpj={null}
+      origins={[{ cnpj: "33453598011400", legal_name: "RAIZEN S.A.", city: "Santa Maria", state: "RS" }]}
+    />,
+  );
+
+  expect(screen.getByText("RAIZEN S.A.")).toBeInTheDocument();
+  expect(screen.queryByText("Não informada")).not.toBeInTheDocument();
+});
+
 it("labels the city as registered origin rather than loading proof", () => {
   render(<FreightOriginSummary origin={{ cnpj: "33453598013705", city: "Esteio", state: "RS" }} />);
 

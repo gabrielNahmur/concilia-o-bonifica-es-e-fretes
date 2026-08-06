@@ -1043,7 +1043,8 @@ export function FreightOriginSummary({ origin }) {
 }
 
 export function FreightOriginFacts({ senderName, senderCnpj, origins = [] }) {
-  return <div><span>Origem cadastral</span><strong>{senderName || "Não informada"}</strong><small>{senderCnpj || "—"}</small>{origins.map((origin) => <small key={origin.cnpj}>{origin.cnpj} • <span><FreightOriginSummary origin={origin} /></span></small>)}</div>;
+  const singleOrigin = origins.length === 1 ? origins[0] : null;
+  return <div><span>Origem cadastral</span><strong>{senderName || singleOrigin?.legal_name || "Não informada"}</strong><small>{senderCnpj || singleOrigin?.cnpj || "—"}</small>{origins.map((origin) => <small key={origin.cnpj}>{origins.length > 1 ? `${origin.legal_name || origin.cnpj} • ` : ""}<span><FreightOriginSummary origin={origin} /></span></small>)}</div>;
 }
 
 function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
