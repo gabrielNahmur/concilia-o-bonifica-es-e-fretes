@@ -390,6 +390,76 @@ def test_global_lookup_window_reopens_only_after_sixty_seconds(monkeypatch):
     assert len(sent) == 6
 
 
+def test_global_lookup_window_records_each_real_call_instant(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    start = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    now = [start]
+    next_instants = iter((
+        start + timedelta(seconds=8),
+        start + timedelta(seconds=16),
+        start + timedelta(seconds=60, milliseconds=1),
+        start + timedelta(seconds=60, milliseconds=2),
+        start + timedelta(seconds=60, milliseconds=3),
+    ))
+    sent = []
+    monkeypatch.setattr(cnpj_registry, "utcnow", lambda: now[0])
+
+    def record_sent(_db, cnpjs):
+        for cnpj in cnpjs:
+            sent.append(cnpj)
+            now[0] = next(next_instants)
+        return len(cnpjs)
+
+    monkeypatch.setattr(erp_sync, "refresh_freight_origins", record_sent)
+    with Session(engine, autoflush=False) as db:
+        first_batch = ["11111111000111", "22222222000122", "33333333000133"]
+        later_batch = ["44444444000144", "55555555000155"]
+
+        assert erp_sync.refresh_selected_freight_origins(db, first_batch) == (3, 3)
+        assert erp_sync.refresh_selected_freight_origins(db, later_batch) == (1, 1)
+
+    assert sent == [*first_batch, later_batch[0]]
+
+
+def test_refresh_normalizes_whitespace_only_location_fields_to_none():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+
+    def fetch(cnpj: str) -> CnpjLocation:
+        return CnpjLocation(cnpj, "RAIZEN S.A.", "   ", " RS ", "cnpj_ws")
+
+    with Session(engine) as db:
+        assert refresh_freight_origins(db, ["33453598013705"], fetch) == 0
+        db.commit()
+        origin = db.get(FreightOrigin, "33453598013705")
+
+        assert origin is not None
+        assert origin.city is None
+        assert origin.state == "RS"
+        assert origin.last_success_at is None
+        assert origin.next_retry_at is not None
+
+
+def test_blank_registered_origin_remains_pending_after_cooldown():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cnpj = "11111111000111"
+    with Session(engine) as db:
+        db.add_all((_purchase(1, cnpj), _cte(1)))
+        db.add(FreightCteInvoice(erp_cte_id=1, sequence=1, resolved_purchase_entry_id=1))
+        db.add(FreightOrigin(
+            cnpj=cnpj,
+            city="   ",
+            state="RS",
+            next_retry_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+        ))
+        db.commit()
+
+        assert erp_sync.unresolved_resolved_freight_origin_cnpjs(db) == [cnpj]
+        assert erp_sync.pending_resolved_freight_origin_cnpjs(db) == [cnpj]
+
+
 def test_backfill_freight_origins_reports_enriched_and_pending(monkeypatch, capsys):
     script = import_module("app.scripts.backfill_freight_origins")
     engine = create_engine("sqlite:///:memory:")

@@ -8,7 +8,7 @@ from decimal import Decimal
 from uuid import UUID
 
 import pymssql
-from sqlalchemy import and_, delete, or_, select, update
+from sqlalchemy import and_, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -31,7 +31,7 @@ from app.services.cnpj_registry import (
     CnpjLookupError,
     normalize_cnpj,
     refresh_freight_origins,
-    reserve_cnpj_ws_batch,
+    reserve_cnpj_ws_call,
 )
 
 
@@ -610,6 +610,8 @@ def _resolved_freight_origin_cnpjs(
         FreightOrigin.cnpj.is_(None),
         FreightOrigin.city.is_(None),
         FreightOrigin.state.is_(None),
+        func.trim(FreightOrigin.city) == "",
+        func.trim(FreightOrigin.state) == "",
     )
     if eligible_now:
         now = datetime.now(timezone.utc)
@@ -649,14 +651,22 @@ def unresolved_resolved_freight_origin_cnpjs(db: Session) -> list[str]:
 
 
 def refresh_selected_freight_origins(db: Session, cnpjs: list[str]) -> tuple[int, int]:
-    batch = reserve_cnpj_ws_batch(db, cnpjs)
-    if not batch:
-        return 0, 0
-    try:
-        return len(batch), refresh_freight_origins(db, batch)
-    except CnpjLookupError as error:
-        logger.warning("Freight origin refresh failed without interrupting sync: %s", error)
-        return len(batch), 0
+    checked = 0
+    enriched = 0
+    seen = set()
+    for raw_cnpj in cnpjs:
+        cnpj = normalize_cnpj(raw_cnpj)
+        if not cnpj or cnpj in seen:
+            continue
+        seen.add(cnpj)
+        if not reserve_cnpj_ws_call(db):
+            break
+        checked += 1
+        try:
+            enriched += refresh_freight_origins(db, [cnpj])
+        except CnpjLookupError as error:
+            logger.warning("Freight origin refresh failed without interrupting sync: %s", error)
+    return checked, enriched
 
 
 def refresh_origins_from_resolved_freight_invoices(db: Session, limit: int = 3) -> int:

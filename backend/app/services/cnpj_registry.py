@@ -40,23 +40,13 @@ def _as_utc(value):
     return value.astimezone(timezone.utc)
 
 
-def reserve_cnpj_ws_batch(db: Session, cnpjs: Iterable[str]) -> list[str]:
-    """Persist and return the CNPJs allowed in the current rolling window.
+def reserve_cnpj_ws_call(db: Session) -> bool:
+    """Persist one API call immediately before the outbound request.
 
     PostgreSQL serializes concurrent worker/backfill reservations through the
-    pre-seeded singleton row. Committing the reservation before HTTP calls
-    keeps the quota consumed even if later application work is rolled back.
+    pre-seeded singleton row. Committing each reservation separately keeps its
+    real call instant in the rolling window, even if later work is rolled back.
     """
-    normalized = []
-    seen = set()
-    for raw_cnpj in cnpjs:
-        cnpj = normalize_cnpj(raw_cnpj)
-        if cnpj and cnpj not in seen:
-            seen.add(cnpj)
-            normalized.append(cnpj)
-    if not normalized:
-        return []
-
     row = db.scalar(
         select(ExternalApiRateLimit)
         .where(ExternalApiRateLimit.source == CNPJ_WS_SOURCE)
@@ -74,13 +64,16 @@ def reserve_cnpj_ws_batch(db: Session, cnpjs: Iterable[str]) -> list[str]:
         for value in (row.call_1_at, row.call_2_at, row.call_3_at)
         if value is not None and _as_utc(value) > cutoff
     )
-    batch = normalized[: max(0, CNPJ_WS_MAX_CALLS - len(recent))]
-    reservations = (recent + [now] * len(batch))[-CNPJ_WS_MAX_CALLS:]
+    if len(recent) >= CNPJ_WS_MAX_CALLS:
+        db.commit()
+        return False
+
+    reservations = (recent + [now])[-CNPJ_WS_MAX_CALLS:]
     padded = [None] * (CNPJ_WS_MAX_CALLS - len(reservations)) + reservations
     row.call_1_at, row.call_2_at, row.call_3_at = padded
     row.updated_at = now
     db.commit()
-    return batch
+    return True
 
 
 def fetch_cnpj_location(cnpj: str) -> CnpjLocation | None:
@@ -116,7 +109,7 @@ def refresh_freight_origins(
             continue
 
         origin = db.get(FreightOrigin, cnpj)
-        if origin and origin.city and origin.state:
+        if origin and _clean_location_text(origin.city) and _clean_location_text(origin.state):
             continue
 
         if origin is None:
@@ -145,10 +138,10 @@ def refresh_freight_origins(
             continue
 
         origin.legal_name = location.legal_name
-        origin.city = location.city
-        origin.state = location.state
+        origin.city = _clean_location_text(location.city)
+        origin.state = _clean_location_text(location.state, uppercase=True)
         origin.source = location.source
-        if not location.city or not location.state:
+        if not origin.city or not origin.state:
             origin.last_error = "Resposta incompleta: cidade e UF são obrigatórias"
             origin.next_retry_at = now + timedelta(hours=24)
             continue
@@ -158,3 +151,10 @@ def refresh_freight_origins(
         refreshed += 1
 
     return refreshed
+
+
+def _clean_location_text(value: str | None, *, uppercase: bool = False) -> str | None:
+    cleaned = value.strip() if value else ""
+    if not cleaned:
+        return None
+    return cleaned.upper() if uppercase else cleaned
