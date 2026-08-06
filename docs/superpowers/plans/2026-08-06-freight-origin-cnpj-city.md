@@ -299,4 +299,3 @@ Expected: all backend and frontend checks pass; no whitespace errors.
 git add backend/app/scripts/backfill_freight_origins.py backend/tests/test_freight_origins.py docs/qa/freight-origin-city.md
 git commit -m "docs(freight): add origin registry release checks"
 ```
-
