@@ -8,7 +8,7 @@ from decimal import Decimal
 from uuid import UUID
 
 import pymssql
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -18,6 +18,7 @@ from app.models import (
     FinancialEntry,
     FreightCte,
     FreightCteInvoice,
+    FreightOrigin,
     PayableDocument,
     PayableMovement,
     Purchase,
@@ -26,6 +27,7 @@ from app.models import (
     Unit,
 )
 from app.services.seed import map_supplier
+from app.services.cnpj_registry import CnpjLookupError, refresh_freight_origins
 
 
 logger = logging.getLogger(__name__)
@@ -593,6 +595,31 @@ def sync_payable_movements(db: Session, cursor, since: datetime) -> int:
     return len(rows)
 
 
+def refresh_origins_from_resolved_freight_invoices(db: Session, limit: int = 3) -> int:
+    now = datetime.now(timezone.utc)
+    pending_origin = or_(
+        FreightOrigin.cnpj.is_(None),
+        (
+            (FreightOrigin.city.is_(None) | FreightOrigin.state.is_(None))
+            & (FreightOrigin.next_retry_at.is_(None) | (FreightOrigin.next_retry_at <= now))
+        ),
+    )
+    cnpjs = db.scalars(
+        select(Purchase.supplier_cnpj)
+        .join(FreightCteInvoice, FreightCteInvoice.resolved_purchase_entry_id == Purchase.erp_entry_id)
+        .outerjoin(FreightOrigin, FreightOrigin.cnpj == Purchase.supplier_cnpj)
+        .where(Purchase.supplier_cnpj.is_not(None), pending_origin)
+        .distinct()
+        .order_by(Purchase.supplier_cnpj)
+        .limit(limit)
+    ).all()
+    try:
+        return refresh_freight_origins(db, cnpjs)
+    except CnpjLookupError as error:
+        logger.warning("Freight origin refresh failed without interrupting sync: %s", error)
+        return 0
+
+
 def sync_financial(db: Session, cursor, since: datetime) -> int:
     since = max(since, datetime(2024, 12, 1))
     rows = _fetch(
@@ -742,6 +769,7 @@ def process_sync_run(db: Session, run: SyncRun) -> SyncRun:
                 processed += sync_step(db, cursor, since)
             db.commit()
             logger.info("Finished ERP sync step: %s", sync_step.__name__)
+        refresh_origins_from_resolved_freight_invoices(db)
         from app.services.freight_reconciliation import rebuild_freight_reconciliations
         from app.services.reconciliation import rebuild_reconciliations
 

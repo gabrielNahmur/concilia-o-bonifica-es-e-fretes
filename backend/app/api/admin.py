@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.dependencies import AdminUser, DbSession
-from app.models import BonusRule, Company, Contract, FreightCte, FreightRate, ReportRecipient, SupplierAlias, SyncRun, Unit, User
+from app.models import BonusRule, Company, Contract, FreightCte, FreightOrigin, FreightRate, ReportRecipient, SupplierAlias, SyncRun, Unit, User
 from app.security import hash_password
 from app.services.audit import audit
 from app.services.erp_sync import queue_sync
@@ -526,12 +526,23 @@ def _ensure_rate_does_not_overlap(db: DbSession, values: dict, ignore_id: int | 
         raise HTTPException(status_code=409, detail="Já existe uma tarifa ativa sobreposta para a mesma combinação")
 
 
-def _freight_rate(row: FreightRate) -> dict:
+def _freight_rate(row: FreightRate, origins: dict[str, FreightOrigin]) -> dict:
+    origin = origins.get(row.origin_cnpj) if row.origin_cnpj else None
     return {
         "id": row.id,
         "carrier_cnpj": row.carrier_cnpj,
         "carrier_name": row.carrier_name,
         "origin_cnpj": row.origin_cnpj,
+        "origin": (
+            {
+                "cnpj": origin.cnpj,
+                "legal_name": origin.legal_name,
+                "city": origin.city,
+                "state": origin.state,
+                "source": origin.source,
+            }
+            if origin else None
+        ),
         "unit_code": row.unit_code,
         "effective_from": row.effective_from,
         "effective_to": row.effective_to,
@@ -549,7 +560,12 @@ def list_freight_rates(db: DbSession, _: AdminUser):
     rows = db.scalars(
         select(FreightRate).order_by(FreightRate.carrier_name, FreightRate.effective_from.desc(), FreightRate.id)
     ).all()
-    return [_freight_rate(row) for row in rows]
+    origin_cnpjs = {row.origin_cnpj for row in rows if row.origin_cnpj}
+    origins = {
+        origin.cnpj: origin
+        for origin in db.scalars(select(FreightOrigin).where(FreightOrigin.cnpj.in_(origin_cnpjs))).all()
+    } if origin_cnpjs else {}
+    return [_freight_rate(row, origins) for row in rows]
 
 
 @router.get("/freight-carriers")

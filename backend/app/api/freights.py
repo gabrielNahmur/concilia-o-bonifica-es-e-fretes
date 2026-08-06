@@ -15,6 +15,7 @@ from app.dependencies import AdminUser, CurrentUser, DbSession
 from app.models import (
     FreightCte,
     FreightCteInvoice,
+    FreightOrigin,
     FreightRate,
     FreightReconciliation,
     FreightReview,
@@ -210,6 +211,17 @@ def _detail_payload(db: DbSession, row: FreightReconciliation) -> dict:
             select(Purchase).where(Purchase.erp_entry_id.in_(purchase_ids)).options(selectinload(Purchase.items))
         ).all()
     } if purchase_ids else {}
+    origin_cnpjs = {
+        purchase.supplier_cnpj
+        for reference in cte.invoices
+        if reference.resolved_purchase_entry_id is not None
+        for purchase in (purchases.get(reference.resolved_purchase_entry_id),)
+        if purchase and purchase.supplier_cnpj
+    }
+    origins_by_cnpj = {
+        origin.cnpj: origin
+        for origin in db.scalars(select(FreightOrigin).where(FreightOrigin.cnpj.in_(origin_cnpjs))).all()
+    } if origin_cnpjs else {}
     rate = db.get(FreightRate, row.rate_id) if row.rate_id else None
     payable_link = (
         PayableDocument.erp_entry_id == cte.source_entry_id
@@ -257,6 +269,16 @@ def _detail_payload(db: DbSession, row: FreightReconciliation) -> dict:
                     "candidate": _purchase_payload(purchases.get(reference.candidate_purchase_entry_id)),
                 }
                 for reference in sorted(cte.invoices, key=lambda item: item.sequence)
+            ],
+            "origins": [
+                {
+                    "cnpj": cnpj,
+                    "legal_name": origins_by_cnpj[cnpj].legal_name if cnpj in origins_by_cnpj else None,
+                    "city": origins_by_cnpj[cnpj].city if cnpj in origins_by_cnpj else None,
+                    "state": origins_by_cnpj[cnpj].state if cnpj in origins_by_cnpj else None,
+                    "source": origins_by_cnpj[cnpj].source if cnpj in origins_by_cnpj else None,
+                }
+                for cnpj in sorted(origin_cnpjs)
             ],
             "rate": (
                 {
