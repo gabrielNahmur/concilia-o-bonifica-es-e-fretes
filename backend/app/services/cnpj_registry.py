@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 import httpx
 from sqlalchemy.orm import Session
@@ -69,8 +69,13 @@ def refresh_freight_origins(
             db.add(origin)
 
         now = utcnow()
-        if origin.next_retry_at and origin.next_retry_at > now.replace(tzinfo=origin.next_retry_at.tzinfo):
-            continue
+        if origin.next_retry_at:
+            if origin.next_retry_at.tzinfo is None:
+                retry_pending = origin.next_retry_at > now.replace(tzinfo=None)
+            else:
+                retry_pending = origin.next_retry_at.astimezone(timezone.utc) > now.astimezone(timezone.utc)
+            if retry_pending:
+                continue
         origin.last_lookup_at = now
         try:
             location = fetch(cnpj)
