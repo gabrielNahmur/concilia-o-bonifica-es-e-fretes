@@ -609,7 +609,8 @@ def create_freight_rate(payload: FreightRateInput, db: DbSession, actor: AdminUs
     audit(db, actor, "create", "freight_rate", row.id, values)
     recalculated = rebuild_freight_reconciliations(db)
     db.commit()
-    result = _freight_rate(row)
+    origin = db.get(FreightOrigin, row.origin_cnpj) if row.origin_cnpj else None
+    result = _freight_rate(row, {origin.cnpj: origin} if origin else {})
     result["reconciliations_rebuilt"] = recalculated
     return result
 
@@ -629,6 +630,7 @@ def update_freight_rate(rate_id: int, payload: FreightRateInput, db: DbSession, 
     audit(db, actor, "update", "freight_rate", row.id, values)
     recalculated = rebuild_freight_reconciliations(db)
     db.commit()
-    result = _freight_rate(row)
+    origin = db.get(FreightOrigin, row.origin_cnpj) if row.origin_cnpj else None
+    result = _freight_rate(row, {origin.cnpj: origin} if origin else {})
     result["reconciliations_rebuilt"] = recalculated
     return result

@@ -5,9 +5,10 @@ from dataclasses import dataclass
 from datetime import timedelta, timezone
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.models import FreightOrigin, utcnow
+from app.models import ExternalApiRateLimit, FreightOrigin, utcnow
 
 
 class CnpjLookupError(Exception):
@@ -23,9 +24,63 @@ class CnpjLocation:
     source: str
 
 
+CNPJ_WS_SOURCE = "cnpj_ws"
+CNPJ_WS_WINDOW = timedelta(seconds=60)
+CNPJ_WS_MAX_CALLS = 3
+
+
 def normalize_cnpj(value: str) -> str | None:
     cnpj = "".join(character for character in value if character.isdigit())
     return cnpj if len(cnpj) == 14 else None
+
+
+def _as_utc(value):
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def reserve_cnpj_ws_batch(db: Session, cnpjs: Iterable[str]) -> list[str]:
+    """Persist and return the CNPJs allowed in the current rolling window.
+
+    PostgreSQL serializes concurrent worker/backfill reservations through the
+    pre-seeded singleton row. Committing the reservation before HTTP calls
+    keeps the quota consumed even if later application work is rolled back.
+    """
+    normalized = []
+    seen = set()
+    for raw_cnpj in cnpjs:
+        cnpj = normalize_cnpj(raw_cnpj)
+        if cnpj and cnpj not in seen:
+            seen.add(cnpj)
+            normalized.append(cnpj)
+    if not normalized:
+        return []
+
+    row = db.scalar(
+        select(ExternalApiRateLimit)
+        .where(ExternalApiRateLimit.source == CNPJ_WS_SOURCE)
+        .with_for_update()
+    )
+    if row is None:
+        row = ExternalApiRateLimit(source=CNPJ_WS_SOURCE)
+        db.add(row)
+        db.flush()
+
+    now = utcnow()
+    cutoff = now - CNPJ_WS_WINDOW
+    recent = sorted(
+        _as_utc(value)
+        for value in (row.call_1_at, row.call_2_at, row.call_3_at)
+        if value is not None and _as_utc(value) > cutoff
+    )
+    batch = normalized[: max(0, CNPJ_WS_MAX_CALLS - len(recent))]
+    reservations = (recent + [now] * len(batch))[-CNPJ_WS_MAX_CALLS:]
+    padded = [None] * (CNPJ_WS_MAX_CALLS - len(reservations)) + reservations
+    row.call_1_at, row.call_2_at, row.call_3_at = padded
+    row.updated_at = now
+    db.commit()
+    return batch
 
 
 def fetch_cnpj_location(cnpj: str) -> CnpjLocation | None:
@@ -93,6 +148,10 @@ def refresh_freight_origins(
         origin.city = location.city
         origin.state = location.state
         origin.source = location.source
+        if not location.city or not location.state:
+            origin.last_error = "Resposta incompleta: cidade e UF são obrigatórias"
+            origin.next_retry_at = now + timedelta(hours=24)
+            continue
         origin.last_success_at = now
         origin.last_error = None
         origin.next_retry_at = None

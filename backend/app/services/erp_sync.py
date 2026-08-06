@@ -8,7 +8,7 @@ from decimal import Decimal
 from uuid import UUID
 
 import pymssql
-from sqlalchemy import delete, or_, select, update
+from sqlalchemy import and_, delete, or_, select, update
 from sqlalchemy.orm import Session
 
 from app.config import get_settings
@@ -27,7 +27,12 @@ from app.models import (
     Unit,
 )
 from app.services.seed import map_supplier
-from app.services.cnpj_registry import CnpjLookupError, normalize_cnpj, refresh_freight_origins
+from app.services.cnpj_registry import (
+    CnpjLookupError,
+    normalize_cnpj,
+    refresh_freight_origins,
+    reserve_cnpj_ws_batch,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -595,20 +600,28 @@ def sync_payable_movements(db: Session, cursor, since: datetime) -> int:
     return len(rows)
 
 
-def pending_resolved_freight_origin_cnpjs(db: Session, limit: int | None = None) -> list[str]:
-    now = datetime.now(timezone.utc)
-    pending_origin = or_(
+def _resolved_freight_origin_cnpjs(
+    db: Session,
+    *,
+    eligible_now: bool,
+    limit: int | None = None,
+) -> list[str]:
+    incomplete_origin = or_(
         FreightOrigin.cnpj.is_(None),
-        (
-            (FreightOrigin.city.is_(None) | FreightOrigin.state.is_(None))
-            & (FreightOrigin.next_retry_at.is_(None) | (FreightOrigin.next_retry_at <= now))
-        ),
+        FreightOrigin.city.is_(None),
+        FreightOrigin.state.is_(None),
     )
+    if eligible_now:
+        now = datetime.now(timezone.utc)
+        incomplete_origin = and_(
+            incomplete_origin,
+            or_(FreightOrigin.next_retry_at.is_(None), FreightOrigin.next_retry_at <= now),
+        )
     statement = (
         select(Purchase.supplier_cnpj)
         .join(FreightCteInvoice, FreightCteInvoice.resolved_purchase_entry_id == Purchase.erp_entry_id)
         .outerjoin(FreightOrigin, FreightOrigin.cnpj == Purchase.supplier_cnpj)
-        .where(Purchase.supplier_cnpj.is_not(None), pending_origin)
+        .where(Purchase.supplier_cnpj.is_not(None), incomplete_origin)
         .distinct()
         .order_by(Purchase.supplier_cnpj)
     )
@@ -625,17 +638,31 @@ def pending_resolved_freight_origin_cnpjs(db: Session, limit: int | None = None)
     return cnpjs
 
 
-def refresh_selected_freight_origins(db: Session, cnpjs: list[str]) -> int:
+def pending_resolved_freight_origin_cnpjs(db: Session, limit: int | None = None) -> list[str]:
+    """Return unresolved origins eligible for an external lookup now."""
+    return _resolved_freight_origin_cnpjs(db, eligible_now=True, limit=limit)
+
+
+def unresolved_resolved_freight_origin_cnpjs(db: Session) -> list[str]:
+    """Return every unresolved origin, including records in retry cooldown."""
+    return _resolved_freight_origin_cnpjs(db, eligible_now=False)
+
+
+def refresh_selected_freight_origins(db: Session, cnpjs: list[str]) -> tuple[int, int]:
+    batch = reserve_cnpj_ws_batch(db, cnpjs)
+    if not batch:
+        return 0, 0
     try:
-        return refresh_freight_origins(db, cnpjs)
+        return len(batch), refresh_freight_origins(db, batch)
     except CnpjLookupError as error:
         logger.warning("Freight origin refresh failed without interrupting sync: %s", error)
-        return 0
+        return len(batch), 0
 
 
 def refresh_origins_from_resolved_freight_invoices(db: Session, limit: int = 3) -> int:
     cnpjs = pending_resolved_freight_origin_cnpjs(db, limit=limit)
-    return refresh_selected_freight_origins(db, cnpjs)
+    _, enriched = refresh_selected_freight_origins(db, cnpjs)
+    return enriched
 
 
 def sync_financial(db: Session, cursor, since: datetime) -> int:

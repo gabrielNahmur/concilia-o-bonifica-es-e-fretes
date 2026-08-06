@@ -679,6 +679,17 @@ class FreightOrigin(Base):
     )
 
 
+class ExternalApiRateLimit(Base):
+    """Tiny persisted rolling-window state for one external API source."""
+
+    __tablename__ = "external_api_rate_limits"
+    source: Mapped[str] = mapped_column(String(40), primary_key=True)
+    call_1_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    call_2_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    call_3_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, onupdate=utcnow)
+
+
 class FreightRate(Base):
     """Independent, effective-dated freight price reference."""
 
