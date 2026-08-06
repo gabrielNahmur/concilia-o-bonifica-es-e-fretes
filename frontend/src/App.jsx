@@ -1042,6 +1042,10 @@ export function FreightOriginSummary({ origin }) {
   return <>Origem cadastral: {origin.city}{origin.state ? `/${origin.state}` : ""}</>;
 }
 
+export function FreightOriginFacts({ senderName, senderCnpj, origins = [] }) {
+  return <div><span>Origem cadastral</span><strong>{senderName || "Não informada"}</strong><small>{senderCnpj || "—"}</small>{origins.map((origin) => <small key={origin.cnpj}>{origin.cnpj} • <span><FreightOriginSummary origin={origin} /></span></small>)}</div>;
+}
+
 function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
   useDrawerBehavior(onClose);
   const [detail, setDetail] = useState(null);
@@ -1126,7 +1130,7 @@ function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
                   <div><span>Competência da NF-e</span><strong>{d(detail.reference_date)}</strong><small>Data exata quando localizada; mês da chave nas pendências</small></div>
                   <div><span>Emissão registrada no ERP</span><strong>{d(detail.issue_date)}</strong><small>Data original do CT-e</small></div>
                   <div><span>Chave do CT-e</span><strong>{detail.cte.access_key || "Não informada"}</strong></div>
-                  <div><span>Origem</span><strong>{detail.sender_name || "Não informada"}</strong><small>{detail.cte.sender_cnpj || "—"}</small></div>
+                  <FreightOriginFacts senderName={detail.sender_name} senderCnpj={detail.cte.sender_cnpj} origins={detail.origins || []} />
                   <div><span>Finalidade</span><strong>{detail.cte.purpose === 0 ? "Normal" : `Código ${detail.cte.purpose}`}</strong></div>
                   <div><span>Volume auxiliar da carga</span><strong>{n(detail.cte.cargo_liters, 3)} L</strong><small>Não substitui a NF-e</small></div>
                 </div>

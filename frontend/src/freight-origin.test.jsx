@@ -29,7 +29,19 @@ vi.mock("recharts", () => {
   };
 });
 
-import { FreightOriginSummary } from "./App";
+import { FreightOriginFacts, FreightOriginSummary } from "./App";
+
+it("shows the registered city in the CT-e origin facts", () => {
+  render(
+    <FreightOriginFacts
+      senderName="IPIRANGA PRODUTOS DE PETROLEO"
+      senderCnpj="33337122015906"
+      origins={[{ cnpj: "33337122015906", city: "Canoas", state: "RS" }]}
+    />,
+  );
+
+  expect(screen.getByText("Origem cadastral: Canoas/RS")).toBeInTheDocument();
+});
 
 it("labels the city as registered origin rather than loading proof", () => {
   render(<FreightOriginSummary origin={{ cnpj: "33453598013705", city: "Esteio", state: "RS" }} />);
