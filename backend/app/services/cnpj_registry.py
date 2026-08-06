@@ -23,7 +23,7 @@ class CnpjLocation:
     source: str
 
 
-def _normalize_cnpj(value: str) -> str | None:
+def normalize_cnpj(value: str) -> str | None:
     cnpj = "".join(character for character in value if character.isdigit())
     return cnpj if len(cnpj) == 14 else None
 
@@ -56,7 +56,7 @@ def refresh_freight_origins(
 ) -> int:
     refreshed = 0
     for raw_cnpj in cnpjs:
-        cnpj = _normalize_cnpj(raw_cnpj)
+        cnpj = normalize_cnpj(raw_cnpj)
         if not cnpj:
             continue
 

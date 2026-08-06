@@ -27,7 +27,7 @@ from app.models import (
     Unit,
 )
 from app.services.seed import map_supplier
-from app.services.cnpj_registry import CnpjLookupError, refresh_freight_origins
+from app.services.cnpj_registry import CnpjLookupError, normalize_cnpj, refresh_freight_origins
 
 
 logger = logging.getLogger(__name__)
@@ -612,18 +612,30 @@ def pending_resolved_freight_origin_cnpjs(db: Session, limit: int | None = None)
         .distinct()
         .order_by(Purchase.supplier_cnpj)
     )
-    if limit is not None:
-        statement = statement.limit(limit)
-    return db.scalars(statement).all()
+    cnpjs = []
+    seen = set()
+    for raw_cnpj in db.scalars(statement):
+        cnpj = normalize_cnpj(raw_cnpj)
+        if not cnpj or cnpj in seen:
+            continue
+        seen.add(cnpj)
+        cnpjs.append(cnpj)
+        if limit is not None and len(cnpjs) >= limit:
+            break
+    return cnpjs
 
 
-def refresh_origins_from_resolved_freight_invoices(db: Session, limit: int = 3) -> int:
-    cnpjs = pending_resolved_freight_origin_cnpjs(db, limit=limit)
+def refresh_selected_freight_origins(db: Session, cnpjs: list[str]) -> int:
     try:
         return refresh_freight_origins(db, cnpjs)
     except CnpjLookupError as error:
         logger.warning("Freight origin refresh failed without interrupting sync: %s", error)
         return 0
+
+
+def refresh_origins_from_resolved_freight_invoices(db: Session, limit: int = 3) -> int:
+    cnpjs = pending_resolved_freight_origin_cnpjs(db, limit=limit)
+    return refresh_selected_freight_origins(db, cnpjs)
 
 
 def sync_financial(db: Session, cursor, since: datetime) -> int:

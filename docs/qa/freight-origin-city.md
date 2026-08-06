@@ -36,7 +36,7 @@ Execute este roteiro somente depois de a migração, os testes do backend e o bu
    docker exec contracts_app python -m app.scripts.backfill_freight_origins
    ```
 
-   A carga inicial é feita em blocos de três CNPJs: o total de `consultada(s)` representa somente o lote de até três que será enviado à consulta pública, enquanto `pendente(s)` representa o total restante. Registre os totais impressos. Se ainda houver pendências, aguarde **um minuto** antes de executar o próximo bloco; repita somente enquanto houver pendências.
+   A carga inicial é feita em blocos de até três **CNPJs válidos**: o total de `consultada(s)` representa somente o lote que será enviado à consulta pública, enquanto `pendente(s)` representa o total válido restante. CNPJ inválido não entra na métrica nem consome vaga do lote. Registre os totais impressos. Se ainda houver pendências, aguarde **um minuto** antes de executar o próximo bloco; repita somente enquanto houver pendências.
 
 4. Na consulta de fornecedores resolvidos, selecione os cinco CNPJs atuais retornados pela origem de frete e confirme visualmente, em cada um, razão social, cidade e UF cadastradas. Em Tarifas, confira o rótulo `Origem cadastral: Cidade/UF`; abra um CT-e associado e confirme o mesmo rótulo no detalhe. A cidade/UF é referência cadastral, não prova de coleta física.
 

@@ -190,12 +190,12 @@ def test_pending_resolved_freight_origin_cnpjs_returns_all_unregistered_cnpjs_in
     monkeypatch.setattr(erp_sync, "refresh_freight_origins", refresh)
     with Session(engine) as db:
         db.add_all(_purchase(index, cnpj) for index, cnpj in enumerate((
-            "55555555000155", "11111111000111", "44444444000144", "22222222000122", "33333333000133",
+            "55555555000155", "11111111000111", "44444444000144", "22222222000122", "33333333000133", "0000000000000X",
         ), 1))
-        db.add_all(_cte(index) for index in range(1, 6))
+        db.add_all(_cte(index) for index in range(1, 7))
         db.add_all([
             FreightCteInvoice(erp_cte_id=index, sequence=1, resolved_purchase_entry_id=index)
-            for index in range(1, 6)
+            for index in range(1, 7)
         ])
         db.add(FreightOrigin(cnpj="44444444000144", city="Esteio", state="RS"))
         db.commit()
@@ -212,19 +212,29 @@ def test_backfill_freight_origins_reports_enriched_and_pending(monkeypatch, caps
     script = import_module("app.scripts.backfill_freight_origins")
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
-    limits = []
+    refreshed = []
 
-    def pending(_db, limit=None):
-        limits.append(limit)
-        return ["11111111000111", "22222222000122", "33333333000133"] if limit == 3 else ["44444444000144"]
+    def refresh(db, cnpjs):
+        refreshed.extend(cnpjs)
+        for cnpj in cnpjs:
+            db.add(FreightOrigin(cnpj=cnpj, city="Esteio", state="RS"))
+        return len(cnpjs)
 
-    monkeypatch.setattr(script, "pending_resolved_freight_origin_cnpjs", pending)
-    monkeypatch.setattr(script, "refresh_origins_from_resolved_freight_invoices", lambda _db: 3)
-    with Session(engine) as db:
+    monkeypatch.setattr(erp_sync, "refresh_freight_origins", refresh)
+    with Session(engine, autoflush=False) as db:
+        db.add_all(_purchase(index, cnpj) for index, cnpj in enumerate((
+            "0000000000000X", "44444444000144", "11111111000111", "33333333000133", "22222222000122",
+        ), 1))
+        db.add_all(_cte(index) for index in range(1, 6))
+        db.add_all(
+            FreightCteInvoice(erp_cte_id=index, sequence=1, resolved_purchase_entry_id=index)
+            for index in range(1, 6)
+        )
+        db.commit()
         assert script.run(db) == 3
 
     output = capsys.readouterr().out
-    assert limits == [3, None]
+    assert refreshed == ["11111111000111", "22222222000122", "33333333000133"]
     assert "3 origem(ns) consultada(s)" in output
     assert "3 origem(ns) enriquecida(s)" in output
     assert "1 pendente(s)" in output
