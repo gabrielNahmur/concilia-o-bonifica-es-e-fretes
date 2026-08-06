@@ -29,7 +29,14 @@ vi.mock("recharts", () => {
   };
 });
 
-import { FreightOriginFacts, FreightOriginSummary } from "./App";
+import { FreightCteFacts, FreightOriginFacts, FreightOriginSummary } from "./App";
+
+it("does not expose the auxiliary cargo volume in CT-e facts", () => {
+  render(<FreightCteFacts detail={{ reference_date: "2026-07-09", issue_date: "2026-07-09", sender_name: "Fornecedor", origins: [], cte: { access_key: "chave", sender_cnpj: "123", purpose: 0, cargo_liters: 15000 } }} />);
+
+  expect(screen.queryByText(/Volume auxiliar da carga/i)).not.toBeInTheDocument();
+  expect(screen.getByText("Finalidade")).toBeInTheDocument();
+});
 
 it("shows the registered city in the CT-e origin facts", () => {
   render(

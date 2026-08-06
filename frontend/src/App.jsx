@@ -1047,6 +1047,10 @@ export function FreightOriginFacts({ senderName, senderCnpj, origins = [] }) {
   return <div><span>Origem cadastral</span><strong>{senderName || singleOrigin?.legal_name || "Não informada"}</strong><small>{senderCnpj || singleOrigin?.cnpj || "—"}</small>{origins.map((origin) => <small key={origin.cnpj}>{origins.length > 1 ? `${origin.legal_name || origin.cnpj} • ` : ""}<span><FreightOriginSummary origin={origin} /></span></small>)}</div>;
 }
 
+export function FreightCteFacts({ detail }) {
+  return <><div><span>Competência da NF-e</span><strong>{d(detail.reference_date)}</strong><small>Data exata quando localizada; mês da chave nas pendências</small></div><div><span>Emissão registrada no ERP</span><strong>{d(detail.issue_date)}</strong><small>Data original do CT-e</small></div><div><span>Chave do CT-e</span><strong>{detail.cte.access_key || "Não informada"}</strong></div><FreightOriginFacts senderName={detail.sender_name} senderCnpj={detail.cte.sender_cnpj} origins={detail.origins || []} /><div><span>Finalidade</span><strong>{detail.cte.purpose === 0 ? "Normal" : `Código ${detail.cte.purpose}`}</strong></div></>;
+}
+
 function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
   useDrawerBehavior(onClose);
   const [detail, setDetail] = useState(null);
@@ -1127,14 +1131,7 @@ function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
               </div>
               <section className="detail-section">
                 <div className="section-title"><Truck /><div><h3>CT-e e cobrança</h3><p>{detail.cte.source_kind === "purchase_entry" ? `Documento recebido como entrada de compra (Cd_Entrada ${detail.cte.source_entry_id}).` : "Documento sincronizado pelo identificador técnico Cd_CTe."}</p></div></div>
-                <div className="freight-facts">
-                  <div><span>Competência da NF-e</span><strong>{d(detail.reference_date)}</strong><small>Data exata quando localizada; mês da chave nas pendências</small></div>
-                  <div><span>Emissão registrada no ERP</span><strong>{d(detail.issue_date)}</strong><small>Data original do CT-e</small></div>
-                  <div><span>Chave do CT-e</span><strong>{detail.cte.access_key || "Não informada"}</strong></div>
-                  <FreightOriginFacts senderName={detail.sender_name} senderCnpj={detail.cte.sender_cnpj} origins={detail.origins || []} />
-                  <div><span>Finalidade</span><strong>{detail.cte.purpose === 0 ? "Normal" : `Código ${detail.cte.purpose}`}</strong></div>
-                  <div><span>Volume auxiliar da carga</span><strong>{n(detail.cte.cargo_liters, 3)} L</strong><small>Não substitui a NF-e</small></div>
-                </div>
+                <div className="freight-facts"><FreightCteFacts detail={detail} /></div>
               </section>
               <section className="detail-section">
                 <div className="section-title"><FileText /><div><h3>NF-es e itens de combustível</h3><p>A quantidade dos itens em litros é a evidência principal.</p></div></div>
