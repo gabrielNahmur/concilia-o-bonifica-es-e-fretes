@@ -595,7 +595,7 @@ def sync_payable_movements(db: Session, cursor, since: datetime) -> int:
     return len(rows)
 
 
-def refresh_origins_from_resolved_freight_invoices(db: Session, limit: int = 3) -> int:
+def pending_resolved_freight_origin_cnpjs(db: Session, limit: int | None = None) -> list[str]:
     now = datetime.now(timezone.utc)
     pending_origin = or_(
         FreightOrigin.cnpj.is_(None),
@@ -604,15 +604,21 @@ def refresh_origins_from_resolved_freight_invoices(db: Session, limit: int = 3) 
             & (FreightOrigin.next_retry_at.is_(None) | (FreightOrigin.next_retry_at <= now))
         ),
     )
-    cnpjs = db.scalars(
+    statement = (
         select(Purchase.supplier_cnpj)
         .join(FreightCteInvoice, FreightCteInvoice.resolved_purchase_entry_id == Purchase.erp_entry_id)
         .outerjoin(FreightOrigin, FreightOrigin.cnpj == Purchase.supplier_cnpj)
         .where(Purchase.supplier_cnpj.is_not(None), pending_origin)
         .distinct()
         .order_by(Purchase.supplier_cnpj)
-        .limit(limit)
-    ).all()
+    )
+    if limit is not None:
+        statement = statement.limit(limit)
+    return db.scalars(statement).all()
+
+
+def refresh_origins_from_resolved_freight_invoices(db: Session, limit: int = 3) -> int:
+    cnpjs = pending_resolved_freight_origin_cnpjs(db, limit=limit)
     try:
         return refresh_freight_origins(db, cnpjs)
     except CnpjLookupError as error:

@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 from decimal import Decimal
+from importlib import import_module
 
 import pytest
 from sqlalchemy import create_engine, insert, select
@@ -175,6 +176,57 @@ def test_refresh_from_resolved_invoices_limits_pending_supplier_cnpjs_in_order(m
         assert erp_sync.refresh_origins_from_resolved_freight_invoices(db) == 3
 
     assert selected == ["11111111000111", "22222222000122", "33333333000133"]
+
+
+def test_pending_resolved_freight_origin_cnpjs_returns_all_unregistered_cnpjs_in_order(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    selected = []
+
+    def refresh(_db, cnpjs):
+        selected.extend(cnpjs)
+        return len(cnpjs)
+
+    monkeypatch.setattr(erp_sync, "refresh_freight_origins", refresh)
+    with Session(engine) as db:
+        db.add_all(_purchase(index, cnpj) for index, cnpj in enumerate((
+            "55555555000155", "11111111000111", "44444444000144", "22222222000122", "33333333000133",
+        ), 1))
+        db.add_all(_cte(index) for index in range(1, 6))
+        db.add_all([
+            FreightCteInvoice(erp_cte_id=index, sequence=1, resolved_purchase_entry_id=index)
+            for index in range(1, 6)
+        ])
+        db.add(FreightOrigin(cnpj="44444444000144", city="Esteio", state="RS"))
+        db.commit()
+
+        assert erp_sync.pending_resolved_freight_origin_cnpjs(db) == [
+            "11111111000111", "22222222000122", "33333333000133", "55555555000155",
+        ]
+        assert erp_sync.refresh_origins_from_resolved_freight_invoices(db) == 3
+
+    assert selected == ["11111111000111", "22222222000122", "33333333000133"]
+
+
+def test_backfill_freight_origins_reports_enriched_and_pending(monkeypatch, capsys):
+    script = import_module("app.scripts.backfill_freight_origins")
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    calls = 0
+
+    def pending(_db):
+        nonlocal calls
+        calls += 1
+        return ["11111111000111", "22222222000122", "33333333000133", "44444444000144"] if calls == 1 else ["44444444000144"]
+
+    monkeypatch.setattr(script, "pending_resolved_freight_origin_cnpjs", pending)
+    monkeypatch.setattr(script, "refresh_origins_from_resolved_freight_invoices", lambda _db: 3)
+    with Session(engine) as db:
+        assert script.run(db) == 3
+
+    output = capsys.readouterr().out
+    assert "3 origem(ns) enriquecida(s)" in output
+    assert "1 pendente(s)" in output
 
 
 def test_origin_refresh_failure_does_not_change_freight_reconciliation_snapshot(monkeypatch, caplog):
