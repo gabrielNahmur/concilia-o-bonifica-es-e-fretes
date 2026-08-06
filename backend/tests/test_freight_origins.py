@@ -212,12 +212,11 @@ def test_backfill_freight_origins_reports_enriched_and_pending(monkeypatch, caps
     script = import_module("app.scripts.backfill_freight_origins")
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
-    calls = 0
+    limits = []
 
-    def pending(_db):
-        nonlocal calls
-        calls += 1
-        return ["11111111000111", "22222222000122", "33333333000133", "44444444000144"] if calls == 1 else ["44444444000144"]
+    def pending(_db, limit=None):
+        limits.append(limit)
+        return ["11111111000111", "22222222000122", "33333333000133"] if limit == 3 else ["44444444000144"]
 
     monkeypatch.setattr(script, "pending_resolved_freight_origin_cnpjs", pending)
     monkeypatch.setattr(script, "refresh_origins_from_resolved_freight_invoices", lambda _db: 3)
@@ -225,6 +224,8 @@ def test_backfill_freight_origins_reports_enriched_and_pending(monkeypatch, caps
         assert script.run(db) == 3
 
     output = capsys.readouterr().out
+    assert limits == [3, None]
+    assert "3 origem(ns) consultada(s)" in output
     assert "3 origem(ns) enriquecida(s)" in output
     assert "1 pendente(s)" in output
 

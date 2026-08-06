@@ -8,7 +8,7 @@ from app.services.erp_sync import (
 
 
 def run(db: Session) -> int:
-    checked = len(pending_resolved_freight_origin_cnpjs(db))
+    checked = len(pending_resolved_freight_origin_cnpjs(db, limit=3))
     enriched = refresh_origins_from_resolved_freight_invoices(db)
     pending = len(pending_resolved_freight_origin_cnpjs(db))
     db.commit()
