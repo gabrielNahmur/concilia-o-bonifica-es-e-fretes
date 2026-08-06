@@ -7,6 +7,7 @@ from uuid import uuid4
 from sqlalchemy import (
     BigInteger,
     Boolean,
+    CheckConstraint,
     Date,
     DateTime,
     ForeignKey,
@@ -668,6 +669,14 @@ class FreightOrigin(Base):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
     next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+    __table_args__ = (
+        CheckConstraint(
+            "length(cnpj) = 14 AND length(replace(replace(replace(replace(replace("
+            "replace(replace(replace(replace(replace(cnpj, '0', ''), '1', ''), '2', ''), "
+            "'3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')) = 0",
+            name="ck_freight_origins_cnpj_digits",
+        ),
+    )
 
 
 class FreightRate(Base):

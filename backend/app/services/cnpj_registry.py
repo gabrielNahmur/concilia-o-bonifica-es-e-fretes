@@ -69,6 +69,8 @@ def refresh_freight_origins(
             db.add(origin)
 
         now = utcnow()
+        if origin.next_retry_at and origin.next_retry_at > now.replace(tzinfo=origin.next_retry_at.tzinfo):
+            continue
         origin.last_lookup_at = now
         try:
             location = fetch(cnpj)

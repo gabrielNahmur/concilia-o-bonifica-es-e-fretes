@@ -26,6 +26,12 @@ def upgrade() -> None:
         sa.Column("last_success_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("last_error", sa.Text(), nullable=True),
         sa.Column("next_retry_at", sa.DateTime(timezone=True), nullable=True),
+        sa.CheckConstraint(
+            "length(cnpj) = 14 AND length(replace(replace(replace(replace(replace("
+            "replace(replace(replace(replace(replace(cnpj, '0', ''), '1', ''), '2', ''), "
+            "'3', ''), '4', ''), '5', ''), '6', ''), '7', ''), '8', ''), '9', '')) = 0",
+            name="ck_freight_origins_cnpj_digits",
+        ),
     )
     op.create_index("ix_freight_origins_next_retry_at", "freight_origins", ["next_retry_at"])
 
