@@ -40,40 +40,95 @@ def _as_utc(value):
     return value.astimezone(timezone.utc)
 
 
-def reserve_cnpj_ws_call(db: Session) -> bool:
-    """Persist one API call immediately before the outbound request.
-
-    PostgreSQL serializes concurrent worker/backfill reservations through the
-    pre-seeded singleton row. Committing each reservation separately keeps its
-    real call instant in the rolling window, even if later work is rolled back.
-    """
+def _locked_cnpj_ws_limiter(db: Session) -> ExternalApiRateLimit:
+    """Lock the pre-seeded singleton shared by worker and backfill."""
     row = db.scalar(
         select(ExternalApiRateLimit)
         .where(ExternalApiRateLimit.source == CNPJ_WS_SOURCE)
         .with_for_update()
+        .execution_options(populate_existing=True)
     )
     if row is None:
         row = ExternalApiRateLimit(source=CNPJ_WS_SOURCE)
         db.add(row)
         db.flush()
+    return row
 
-    now = utcnow()
+
+def _recent_cnpj_ws_calls(row: ExternalApiRateLimit, now) -> list:
     cutoff = now - CNPJ_WS_WINDOW
-    recent = sorted(
+    return sorted(
         _as_utc(value)
         for value in (row.call_1_at, row.call_2_at, row.call_3_at)
         if value is not None and _as_utc(value) > cutoff
     )
-    if len(recent) >= CNPJ_WS_MAX_CALLS:
-        db.commit()
-        return False
 
-    reservations = (recent + [now])[-CNPJ_WS_MAX_CALLS:]
-    padded = [None] * (CNPJ_WS_MAX_CALLS - len(reservations)) + reservations
+
+def _record_cnpj_ws_call(row: ExternalApiRateLimit, completed_at) -> None:
+    calls = (_recent_cnpj_ws_calls(row, completed_at) + [completed_at])[-CNPJ_WS_MAX_CALLS:]
+    padded = [None] * (CNPJ_WS_MAX_CALLS - len(calls)) + calls
     row.call_1_at, row.call_2_at, row.call_3_at = padded
-    row.updated_at = now
+    row.updated_at = completed_at
+
+
+def _origin_is_complete(origin: FreightOrigin | None) -> bool:
+    return bool(
+        origin
+        and _clean_location_text(origin.city)
+        and _clean_location_text(origin.state)
+    )
+
+
+def _origin_retry_is_pending(origin: FreightOrigin | None, now) -> bool:
+    if origin is None or origin.next_retry_at is None:
+        return False
+    if origin.next_retry_at.tzinfo is None:
+        return origin.next_retry_at > now.replace(tzinfo=None)
+    return origin.next_retry_at.astimezone(timezone.utc) > now.astimezone(timezone.utc)
+
+
+def refresh_freight_origin_under_cnpj_ws_limit(
+    db: Session,
+    raw_cnpj: str,
+    refresh: Callable[[Session, Iterable[str]], int],
+) -> tuple[bool, int]:
+    """Revalidate and execute one lookup while holding the global API lock.
+
+    The singleton remains locked from the quota decision until the refresh
+    returns. The persisted instant is the conservative completion time, so a
+    delayed/preempted fetch cannot make its slot expire before the real call.
+    """
+    cnpj = normalize_cnpj(raw_cnpj)
+    if not cnpj:
+        return False, 0
+
+    limiter = _locked_cnpj_ws_limiter(db)
+    origin = db.scalar(
+        select(FreightOrigin)
+        .where(FreightOrigin.cnpj == cnpj)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    )
+
+    now = utcnow()
+    if _origin_is_complete(origin) or _origin_retry_is_pending(origin, now):
+        db.commit()
+        return False, 0
+
+    if len(_recent_cnpj_ws_calls(limiter, now)) >= CNPJ_WS_MAX_CALLS:
+        db.commit()
+        return False, 0
+
+    try:
+        enriched = refresh(db, [cnpj])
+    except CnpjLookupError:
+        _record_cnpj_ws_call(limiter, utcnow())
+        db.commit()
+        raise
+
+    _record_cnpj_ws_call(limiter, utcnow())
     db.commit()
-    return True
+    return True, enriched
 
 
 def fetch_cnpj_location(cnpj: str) -> CnpjLocation | None:
@@ -109,7 +164,7 @@ def refresh_freight_origins(
             continue
 
         origin = db.get(FreightOrigin, cnpj)
-        if origin and _clean_location_text(origin.city) and _clean_location_text(origin.state):
+        if _origin_is_complete(origin):
             continue
 
         if origin is None:
@@ -117,13 +172,8 @@ def refresh_freight_origins(
             db.add(origin)
 
         now = utcnow()
-        if origin.next_retry_at:
-            if origin.next_retry_at.tzinfo is None:
-                retry_pending = origin.next_retry_at > now.replace(tzinfo=None)
-            else:
-                retry_pending = origin.next_retry_at.astimezone(timezone.utc) > now.astimezone(timezone.utc)
-            if retry_pending:
-                continue
+        if _origin_retry_is_pending(origin, now):
+            continue
         origin.last_lookup_at = now
         try:
             location = fetch(cnpj)

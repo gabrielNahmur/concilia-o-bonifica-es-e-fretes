@@ -4,7 +4,7 @@ from importlib import import_module
 
 import pytest
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, delete, insert, select
+from sqlalchemy import create_engine, delete, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, selectinload
 
@@ -12,7 +12,16 @@ from app.database import Base, SessionLocal
 from app.api.admin import list_freight_rates
 from app.api.freights import _detail_payload
 from app.main import app
-from app.models import FreightCte, FreightCteInvoice, FreightOrigin, FreightRate, FreightReconciliation, Purchase, User
+from app.models import (
+    ExternalApiRateLimit,
+    FreightCte,
+    FreightCteInvoice,
+    FreightOrigin,
+    FreightRate,
+    FreightReconciliation,
+    Purchase,
+    User,
+)
 from app.security import hash_password
 from app.services import cnpj_registry
 from app.services.cnpj_registry import CnpjLocation, CnpjLookupError, refresh_freight_origins
@@ -390,7 +399,7 @@ def test_global_lookup_window_reopens_only_after_sixty_seconds(monkeypatch):
     assert len(sent) == 6
 
 
-def test_global_lookup_window_records_each_real_call_instant(monkeypatch):
+def test_global_lookup_window_uses_conservative_completion_instant(monkeypatch):
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     start = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
@@ -417,9 +426,126 @@ def test_global_lookup_window_records_each_real_call_instant(monkeypatch):
         later_batch = ["44444444000144", "55555555000155"]
 
         assert erp_sync.refresh_selected_freight_origins(db, first_batch) == (3, 3)
-        assert erp_sync.refresh_selected_freight_origins(db, later_batch) == (1, 1)
+        assert erp_sync.refresh_selected_freight_origins(db, later_batch) == (0, 0)
 
-    assert sent == [*first_batch, later_batch[0]]
+    assert sent == first_batch
+
+
+def test_global_lookup_window_survives_delay_between_decision_and_actual_fetch(monkeypatch):
+    """A preempted lookup must not let four real calls start in one window."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    start = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    now = [start]
+    sent = []
+    monkeypatch.setattr(cnpj_registry, "utcnow", lambda: now[0])
+
+    def delayed_refresh(_db, cnpjs):
+        if not sent:
+            now[0] = start + timedelta(seconds=61)
+        sent.extend((cnpj, now[0]) for cnpj in cnpjs)
+        return len(cnpjs)
+
+    monkeypatch.setattr(erp_sync, "refresh_freight_origins", delayed_refresh)
+    with Session(engine, autoflush=False) as db:
+        cnpjs = [
+            "11111111000111",
+            "22222222000122",
+            "33333333000133",
+            "44444444000144",
+        ]
+        assert erp_sync.refresh_selected_freight_origins(db, cnpjs) == (3, 3)
+
+    assert [cnpj for cnpj, _ in sent] == cnpjs[:3]
+    assert {instant for _, instant in sent} == {start + timedelta(seconds=61)}
+
+
+def test_stale_candidate_enriched_before_lock_does_not_fetch_count_or_consume_slot(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cnpj = "11111111000111"
+    sent = []
+
+    def record_refresh(_db, cnpjs):
+        sent.extend(cnpjs)
+        return 0
+
+    monkeypatch.setattr(erp_sync, "refresh_freight_origins", record_refresh)
+    with Session(engine, autoflush=False) as db:
+        db.add(FreightOrigin(cnpj=cnpj, city="Esteio", state="RS", source="cnpj_ws"))
+        db.commit()
+
+        assert erp_sync.refresh_selected_freight_origins(db, [cnpj]) == (0, 0)
+
+        limiter = db.get(ExternalApiRateLimit, cnpj_registry.CNPJ_WS_SOURCE)
+        assert limiter is None or all(
+            instant is None for instant in (limiter.call_1_at, limiter.call_2_at, limiter.call_3_at)
+        )
+
+    assert sent == []
+
+
+def test_locked_revalidation_refreshes_an_origin_stale_in_the_session(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    cnpj = "11111111000111"
+    sent = []
+
+    def record_refresh(_db, cnpjs):
+        sent.extend(cnpjs)
+        return 0
+
+    monkeypatch.setattr(erp_sync, "refresh_freight_origins", record_refresh)
+    with Session(engine, autoflush=False, expire_on_commit=False) as db:
+        db.add(FreightOrigin(cnpj=cnpj))
+        db.commit()
+        cached = db.get(FreightOrigin, cnpj)
+        assert cached is not None and cached.city is None
+
+        with Session(engine) as concurrent_db:
+            concurrent_db.execute(
+                update(FreightOrigin)
+                .where(FreightOrigin.cnpj == cnpj)
+                .values(city="Esteio", state="RS", source="cnpj_ws")
+            )
+            concurrent_db.commit()
+
+        assert cached.city is None
+        assert erp_sync.refresh_selected_freight_origins(db, [cnpj]) == (0, 0)
+
+    assert sent == []
+
+
+def test_locked_quota_decision_refreshes_rate_limit_state_stale_in_the_session(monkeypatch):
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    instant = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+    sent = []
+    monkeypatch.setattr(cnpj_registry, "utcnow", lambda: instant + timedelta(seconds=1))
+
+    def record_refresh(_db, cnpjs):
+        sent.extend(cnpjs)
+        return 0
+
+    monkeypatch.setattr(erp_sync, "refresh_freight_origins", record_refresh)
+    with Session(engine, autoflush=False, expire_on_commit=False) as db:
+        db.add(ExternalApiRateLimit(source=cnpj_registry.CNPJ_WS_SOURCE))
+        db.commit()
+        cached = db.get(ExternalApiRateLimit, cnpj_registry.CNPJ_WS_SOURCE)
+        assert cached is not None and cached.call_1_at is None
+
+        with Session(engine) as concurrent_db:
+            concurrent_db.execute(
+                update(ExternalApiRateLimit)
+                .where(ExternalApiRateLimit.source == cnpj_registry.CNPJ_WS_SOURCE)
+                .values(call_1_at=instant, call_2_at=instant, call_3_at=instant)
+            )
+            concurrent_db.commit()
+
+        assert cached.call_1_at is None
+        assert erp_sync.refresh_selected_freight_origins(db, ["11111111000111"]) == (0, 0)
+
+    assert sent == []
 
 
 def test_refresh_normalizes_whitespace_only_location_fields_to_none():

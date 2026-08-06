@@ -30,8 +30,8 @@ from app.services.seed import map_supplier
 from app.services.cnpj_registry import (
     CnpjLookupError,
     normalize_cnpj,
+    refresh_freight_origin_under_cnpj_ws_limit,
     refresh_freight_origins,
-    reserve_cnpj_ws_call,
 )
 
 
@@ -659,13 +659,20 @@ def refresh_selected_freight_origins(db: Session, cnpjs: list[str]) -> tuple[int
         if not cnpj or cnpj in seen:
             continue
         seen.add(cnpj)
-        if not reserve_cnpj_ws_call(db):
-            break
-        checked += 1
         try:
-            enriched += refresh_freight_origins(db, [cnpj])
+            started, refreshed = refresh_freight_origin_under_cnpj_ws_limit(
+                db,
+                cnpj,
+                refresh_freight_origins,
+            )
         except CnpjLookupError as error:
+            checked += 1
             logger.warning("Freight origin refresh failed without interrupting sync: %s", error)
+            continue
+        if not started:
+            continue
+        checked += 1
+        enriched += refreshed
     return checked, enriched
 
 
