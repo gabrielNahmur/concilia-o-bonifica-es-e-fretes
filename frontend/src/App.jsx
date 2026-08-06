@@ -1036,6 +1036,12 @@ export function Purchases() {
   </>;
 }
 
+export function FreightOriginSummary({ origin }) {
+  if (!origin) return null;
+  if (!origin.city) return <>Cidade cadastral não identificada</>;
+  return <>Origem cadastral: {origin.city}{origin.state ? `/${origin.state}` : ""}</>;
+}
+
 function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
   useDrawerBehavior(onClose);
   const [detail, setDetail] = useState(null);
@@ -1150,6 +1156,7 @@ function FreightDetail({ reconciliationId, user, onClose, onChanged }) {
                 <div className="detail-section">
                   <div className="section-title"><Gauge /><div><h3>Tarifa aplicada</h3><p>Escopo mais específico e vigência da competência da NF-e.</p></div></div>
                   {detail.rate ? <div className="freight-rate-value"><strong>{rateMoney(detail.rate.rate_per_liter)} / L</strong><span>desde {d(detail.rate.effective_from)}{detail.rate.effective_to ? ` até ${d(detail.rate.effective_to)}` : " • sem data final"}</span><small>{detail.rate.scope.unit_code ? `Unidade ${detail.rate.scope.unit_code}` : "Todas as unidades"} • {detail.rate.scope.origin_cnpj || "Todas as origens"}</small></div> : <Empty text="Sem histórico de tarifa nesta competência; somente a cobrança é exibida." />}
+                  {detail.origins?.length ? <div className="freight-rate-value">{detail.origins.map((origin) => <small key={origin.cnpj}>{origin.cnpj} • <FreightOriginSummary origin={origin} /></small>)}</div> : null}
                 </div>
                 <div className="detail-section">
                   <div className="section-title"><CreditCard /><div><h3>Contas a pagar</h3><p>{detail.cte.source_kind === "purchase_entry" ? "Título ligado diretamente pela entrada do CT-e." : "Títulos ligados diretamente pelo Cd_CTe."}</p></div></div>
@@ -4151,7 +4158,7 @@ function FreightRatesAdmin({ rows, reload, carrierRows = [] }) {
       <div className="admin-list freight-rate-list">
         {rows.map((row) => <div key={row.id}>
           <div className="avatar"><Truck /></div>
-          <div><strong>{row.carrier_name || row.carrier_cnpj}</strong><span>{row.origin_cnpj ? `Origem ${row.origin_cnpj}` : "Todas as origens"} • {row.unit_code ? `Unidade ${row.unit_code}` : "Todas as unidades"}</span><small>{d(row.effective_from)} a {row.effective_to ? d(row.effective_to) : "sem data final"}</small></div>
+          <div><strong>{row.carrier_name || row.carrier_cnpj}</strong><span>{row.origin_cnpj ? `Origem ${row.origin_cnpj}` : "Todas as origens"} • {row.unit_code ? `Unidade ${row.unit_code}` : "Todas as unidades"}</span>{row.origin_cnpj && <small className="table-subline"><FreightOriginSummary origin={row.origin} /></small>}<small>{d(row.effective_from)} a {row.effective_to ? d(row.effective_to) : "sem data final"}</small></div>
           <div className="freight-rate-amount"><strong>{rateMoney(row.rate_per_liter)} / L</strong><Badge status={row.active ? "confirmed" : "canceled"}>{row.active ? "Ativa" : "Inativa"}</Badge></div>
           <button className="icon-button" onClick={() => start(row)} title="Editar" aria-label={`Editar tarifa de ${row.carrier_name} vigente desde ${d(row.effective_from)}`}><Pencil /></button>
           {row.active && <button className="icon-button danger" onClick={() => deactivate(row)} title="Desativar" aria-label={`Desativar tarifa de ${row.carrier_name} vigente desde ${d(row.effective_from)}`}><X /></button>}
