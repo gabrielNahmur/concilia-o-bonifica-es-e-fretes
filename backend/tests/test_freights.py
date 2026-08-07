@@ -262,7 +262,7 @@ def test_access_key_month_controls_competence_when_document_date_is_missing():
         assert row.reference_date == date(2026, 3, 1)
         assert row.primary_status == "document_mismatch"
         assert any(issue["code"] == "reference_month_from_access_key" for issue in json.loads(row.issues_json))
-        assert len(db.scalars(_statement("2026-03", None, None, None, None)).all()) == 1
+        assert len(db.scalars(_statement("2026-03", None, None, None, None)).all()) == 0
         assert len(db.scalars(_statement("2026-04", None, None, None, None)).all()) == 0
 
 
@@ -273,7 +273,15 @@ def test_dashboard_statement_hides_canceled_ctes_but_keeps_audit_record():
         seed_reference_data(db)
         active = _cte(8101, 1901, "002", "883", "5000")
         canceled = _cte(8102, 1888, "002", "2565", "10000", canceled=True)
-        db.add_all((active, canceled))
+        active_key = "4" * 44
+        db.add_all(
+            (
+                _purchase(38101, "002", 1901, active_key, "5000"),
+                active,
+                canceled,
+                FreightCteInvoice(erp_cte_id=8101, sequence=1, reference_access_key=active_key),
+            )
+        )
         db.commit()
         rebuild_freight_reconciliations(db)
         db.commit()
@@ -340,14 +348,62 @@ def test_zero_verified_liters_never_becomes_a_false_freight_difference():
         issues = json.loads(row.issues_json)
         assert any(issue["code"] == "missing_verified_liters" for issue in issues)
         listed = list_freights(db, None, competence=["2026-06"], unit=["002"], page=1, page_size=50)
-        item = next(item for item in listed["items"] if item["erp_cte_id"] == 301002)
-        assert item["rate_available"] is True
-        assert item["comparison_available"] is False
-        assert item["has_rate"] is False
-        assert item["difference_value"] == 0.0
+        assert all(item["erp_cte_id"] != 301002 for item in listed["items"])
         summary = freight_summary(db, None, competence=["2026-06"], unit=["002"])
+        assert summary["total_ctes"] == 0
         assert summary["difference"] == 0.0
-        assert summary["uncomparable_ctes"] >= 1
+        assert summary["uncomparable_ctes"] == 0
+
+
+def test_document_mismatch_is_hidden_from_operational_freight_views():
+    """Document errors stay auditable but must not inflate freight operations."""
+    local_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(local_engine)
+    with Session(local_engine) as db:
+        correct_id = 301101
+        divergent_id = 301102
+        db.add_all(
+            (
+                _cte(correct_id, 2501, "002", "1525", "10000"),
+                _cte(divergent_id, 2502, "002", "1220", "8000"),
+                FreightReconciliation(
+                    erp_cte_id=correct_id,
+                    reference_date=date(2026, 6, 12),
+                    matched_liters=Decimal("10000"),
+                    expected_value=Decimal("1525"),
+                    charged_value=Decimal("1525"),
+                    difference_value=Decimal("0"),
+                    rate_id=1,
+                    primary_status="correct",
+                    algorithm_version="freight-v5",
+                    fingerprint="correct".zfill(64),
+                ),
+                FreightReconciliation(
+                    erp_cte_id=divergent_id,
+                    reference_date=date(2026, 6, 12),
+                    matched_liters=Decimal("0"),
+                    expected_value=Decimal("0"),
+                    charged_value=Decimal("1220"),
+                    difference_value=Decimal("0"),
+                    primary_status="document_mismatch",
+                    algorithm_version="freight-v5",
+                    fingerprint="divergent".zfill(64),
+                ),
+            )
+        )
+        db.commit()
+
+        operational_rows = db.scalars(_statement("2026-06", None, None, None, None)).all()
+        summary = freight_summary(db, None, competence="2026-06")
+
+        assert [row.erp_cte_id for row in operational_rows] == [correct_id]
+        assert summary["total_ctes"] == 1
+        assert summary["charged"] == 1525.0
+        assert db.scalar(
+            select(FreightReconciliation).where(
+                FreightReconciliation.erp_cte_id == divergent_id
+            )
+        ) is not None
 
 
 def test_freight_filters_accept_multi_select_and_card_details_use_same_scope():
@@ -600,14 +656,13 @@ def test_cte_2426_suggests_only_nf_4200716_and_admin_confirmation_is_audited():
         assert client.get(f"/api/freights/{reconciliation_id}").status_code == 200
         search = client.get("/api/freights", params={"search": "2426", "page_size": 200})
         assert search.status_code == 200
-        assert search.json()["total"] == 1
-        assert search.json()["items"][0]["cte_number"] == 2426
+        assert search.json()["total"] == 0
         multi = client.get(
             "/api/freights",
             params=[("competence", "2026-06,2026-07"), ("unit", "002,012"), ("page_size", "200")],
         )
         assert multi.status_code == 200, multi.text
-        assert any(item["cte_number"] == 2426 for item in multi.json()["items"])
+        assert all(item["cte_number"] != 2426 for item in multi.json()["items"])
         june_only = client.get(
             "/api/freights",
             params=[("competence", "2026-06"), ("page_size", "200")],
@@ -623,7 +678,7 @@ def test_cte_2426_suggests_only_nf_4200716_and_admin_confirmation_is_audited():
             params=[("metric", "pending"), ("competence", "2026-06"), ("unit", "002")],
         )
         assert drill_down.status_code == 200, drill_down.text
-        assert any(item["cte_number"] == 2426 for item in drill_down.json()["items"])
+        assert all(item["cte_number"] != 2426 for item in drill_down.json()["items"])
         assert client.post(f"/api/freights/{reconciliation_id}/review", json={"action": "confirm", "notes": "NF correta confirmada", "candidate_purchase_entry_id": 324260, "fingerprint": fingerprint}).status_code == 403
         assert client.get("/api/admin/freight-rates").status_code == 403
         assert client.get("/api/admin/freight-carriers").status_code == 403

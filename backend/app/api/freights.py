@@ -64,6 +64,7 @@ def _statement(
     statement = select(FreightReconciliation).join(FreightCte).where(
         FreightCte.source_active.is_(True),
         FreightCte.is_canceled.is_(False),
+        FreightReconciliation.primary_status != "document_mismatch",
     )
     competence_ranges = [_month_bounds(value) for value in _values(competence)]
     if competence_ranges:
