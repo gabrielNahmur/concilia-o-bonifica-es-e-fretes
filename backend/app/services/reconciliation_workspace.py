@@ -23,6 +23,7 @@ from app.models import (
     ReconciliationItem,
 )
 from app.services.reconciliation import (
+    contractual_purchase_date,
     invoice_discount_forfeited_by_late_payment,
     uses_next_month_ipiranga_portal_credit,
 )
@@ -161,20 +162,22 @@ def _upsert_evidence(db: Session, row: Reconciliation, payload: dict) -> Reconci
 
 
 def _invoice_context(db: Session, row: Reconciliation, rule: BonusRule):
+    contractual_date = contractual_purchase_date(rule)
+    filters = [
+        Purchase.unit_code == row.unit_code,
+        Purchase.mapped_company_code == rule.company_code,
+        contractual_date >= month_start(row.reference_month),
+        contractual_date <= month_end(row.reference_month),
+        contractual_date >= rule.effective_from,
+    ]
+    if rule.effective_to:
+        filters.append(contractual_date <= rule.effective_to)
     purchases = db.scalars(
         select(Purchase)
         .options(selectinload(Purchase.items))
-        .where(
-            Purchase.unit_code == row.unit_code,
-            Purchase.mapped_company_code == rule.company_code,
-            Purchase.purchase_date >= month_start(row.reference_month),
-            Purchase.purchase_date <= month_end(row.reference_month),
-            Purchase.purchase_date >= rule.effective_from,
-        )
-        .order_by(Purchase.purchase_date, Purchase.erp_entry_id)
+        .where(*filters)
+        .order_by(contractual_date, Purchase.erp_entry_id)
     ).all()
-    if rule.effective_to:
-        purchases = [item for item in purchases if item.purchase_date <= rule.effective_to]
     ids = [item.erp_entry_id for item in purchases]
     documents = db.scalars(
         select(PayableDocument).where(PayableDocument.erp_entry_id.in_(ids) if ids else False)

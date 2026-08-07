@@ -581,6 +581,64 @@ def test_units_003_and_004_assign_postpaid_portal_credits_to_the_previous_month(
         assert "mês seguinte" in april_evidence[0]["allocation_reason"]
 
 
+def test_ipiranga_credit_uses_invoice_issue_month_when_entry_crosses_month():
+    """Contractual Ipiranga volume is measured on the NF emission month."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        db.add_all(
+            [
+                Purchase(
+                    erp_entry_id=99501,
+                    unit_code="003",
+                    supplier_name="IPIRANGA PRODUTOS",
+                    supplier_cnpj="33337122015906",
+                    mapped_company_code="IPIRANGA",
+                    invoice_number="3055164",
+                    invoice_issue_date=date(2026, 4, 30),
+                    purchase_date=date(2026, 5, 1),
+                    total_liters=Decimal("8000"),
+                    s10_liters=Decimal("0"),
+                    gross_value=Decimal("43892.80"),
+                    net_value=Decimal("43892.80"),
+                ),
+                PortalBonusEvent(
+                    id="portal-003-may-480",
+                    event_key="portal-003-may-480",
+                    unit_code="003",
+                    company_code="IPIRANGA",
+                    category="postpaid",
+                    portal_date=date(2026, 5, 7),
+                    value=Decimal("480.00"),
+                    description="Bonificacao Postecipada",
+                ),
+            ]
+        )
+        db.flush()
+
+        rebuild_reconciliations(db, today=date(2026, 6, 10), commit=False)
+
+        rule = db.scalar(select(BonusRule).where(BonusRule.unit_code == "003"))
+        april = db.scalar(
+            select(Reconciliation).where(
+                Reconciliation.rule_id == rule.id,
+                Reconciliation.reference_month == date(2026, 4, 1),
+            )
+        )
+        may = db.scalar(
+            select(Reconciliation).where(
+                Reconciliation.rule_id == rule.id,
+                Reconciliation.reference_month == date(2026, 5, 1),
+            )
+        )
+
+        assert (april.expected_value, april.observed_value, april.difference_value) == (
+            Decimal("480.00"), Decimal("480.00"), Decimal("0.00")
+        )
+        assert may.expected_value == Decimal("0.00")
+
+
 def test_probable_match_requires_review_even_when_values_are_equal():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)

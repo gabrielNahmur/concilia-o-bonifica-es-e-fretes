@@ -100,16 +100,24 @@ def invoice_discount_forfeited_by_late_payment(
     )
 
 
+def contractual_purchase_date(rule: BonusRule):
+    """Return the purchase date basis defined by the applicable contract rule."""
+    if rule.kind == "distributor_credit" and rule.company_code == "IPIRANGA":
+        return func.coalesce(Purchase.invoice_issue_date, Purchase.purchase_date)
+    return Purchase.purchase_date
+
+
 def _purchase_totals(db: Session, rule: BonusRule, reference_month: date) -> tuple[Decimal, Decimal, list[int]]:
     end = add_months(reference_month, 1)
+    contractual_date = contractual_purchase_date(rule)
     filters = [
         Purchase.unit_code == rule.unit_code,
         Purchase.mapped_company_code == rule.company_code,
-        Purchase.purchase_date >= max(reference_month, rule.effective_from),
-        Purchase.purchase_date < end,
+        contractual_date >= max(reference_month, rule.effective_from),
+        contractual_date < end,
     ]
     if rule.effective_to:
-        filters.append(Purchase.purchase_date <= rule.effective_to)
+        filters.append(contractual_date <= rule.effective_to)
     rows = db.scalars(select(Purchase).options(selectinload(Purchase.items)).where(*filters)).all()
     entry_ids = [row.erp_entry_id for row in rows]
     documents_by_entry: dict[int, list[PayableDocument]] = defaultdict(list)

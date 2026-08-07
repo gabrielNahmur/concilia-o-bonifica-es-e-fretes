@@ -32,6 +32,7 @@ from app.services.reconciliation_workspace import (
     CONTRACTUAL_EXCLUSION_REVIEW_STATUS,
     _base_item_payloads,
     _automatic_policy,
+    _invoice_context,
     _item_status,
     rebuild_reconciliation_workspace,
 )
@@ -152,6 +153,96 @@ def _invoice_chain(db: Session, with_exact_6204: bool = True):
             )
         )
     db.flush()
+
+
+def test_ipiranga_credit_invoice_context_uses_issue_month_not_erp_entry_month():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "003",
+                BonusRule.kind == "distributor_credit",
+            )
+        )
+        db.add_all(
+            [
+                Purchase(
+                    erp_entry_id=88030,
+                    unit_code="003",
+                    supplier_name="IPIRANGA PRODUTOS",
+                    supplier_cnpj="33337122015906",
+                    mapped_company_code="IPIRANGA",
+                    invoice_number="3055164",
+                    invoice_issue_date=date(2026, 4, 30),
+                    purchase_date=date(2026, 5, 1),
+                    total_liters=Decimal("8000"),
+                    s10_liters=Decimal("0"),
+                    gross_value=Decimal("43892.80"),
+                    net_value=Decimal("43892.80"),
+                ),
+                Reconciliation(
+                    id="row-003-april",
+                    unit_code="003",
+                    rule_id=rule.id,
+                    reference_month=date(2026, 4, 1),
+                    due_date=date(2026, 5, 31),
+                    status="pending",
+                ),
+            ]
+        )
+        db.flush()
+
+        purchases, _, _, _ = _invoice_context(db, db.get(Reconciliation, "row-003-april"), rule)
+
+        assert [purchase.invoice_number for purchase in purchases] == ["3055164"]
+
+
+def test_non_ipiranga_invoice_context_keeps_erp_entry_at_effective_end():
+    """Only Ipiranga distributor credits may use invoice emission as competence."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(
+                BonusRule.unit_code == "005",
+                BonusRule.kind == "invoice_discount",
+            )
+        )
+        rule.effective_to = date(2026, 5, 1)
+        db.add_all(
+            [
+                Purchase(
+                    erp_entry_id=88031,
+                    unit_code="005",
+                    supplier_name="IPIRANGA PRODUTOS",
+                    supplier_cnpj="33337122015906",
+                    mapped_company_code="TEXACO",
+                    invoice_number="3055165",
+                    invoice_issue_date=date(2026, 5, 2),
+                    purchase_date=date(2026, 5, 1),
+                    total_liters=Decimal("10000"),
+                    s10_liters=Decimal("0"),
+                    gross_value=Decimal("54000"),
+                    net_value=Decimal("54000"),
+                ),
+                Reconciliation(
+                    id="row-005-may",
+                    unit_code="005",
+                    rule_id=rule.id,
+                    reference_month=date(2026, 5, 1),
+                    due_date=date(2026, 5, 31),
+                    status="pending",
+                ),
+            ]
+        )
+        db.flush()
+
+        purchases, _, _, _ = _invoice_context(db, db.get(Reconciliation, "row-005-may"), rule)
+
+        assert [purchase.invoice_number for purchase in purchases] == ["3055165"]
 
 
 def test_late_payment_forfeits_texaco_invoice_discount_only():
