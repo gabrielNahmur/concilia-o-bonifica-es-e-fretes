@@ -513,6 +513,52 @@ def test_talisma_batch_matches_nominal_volume_and_leaves_surcharge_unresolved():
         assert matches[-13027].match_status == "missing_reference"
 
 
+def test_supplemental_without_fuel_is_removed_from_freight_reconciliation():
+    """An avulsa freight expense must not enter fuel freight dashboards."""
+    local_engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(local_engine)
+    with Session(local_engine) as db:
+        supplemental = _supplemental(
+            -13027,
+            27,
+            "013",
+            "60",
+            date(2026, 6, 23),
+            "08825400000148",
+        )
+        db.add_all(
+            (
+                supplemental,
+                FreightCteInvoice(erp_cte_id=supplemental.erp_cte_id, sequence=1),
+                FreightReconciliation(
+                    erp_cte_id=supplemental.erp_cte_id,
+                    reference_date=date(2026, 6, 23),
+                    matched_liters=Decimal("0"),
+                    expected_value=Decimal("0"),
+                    charged_value=Decimal("60"),
+                    difference_value=Decimal("0"),
+                    primary_status="document_mismatch",
+                    algorithm_version="freight-v5",
+                    fingerprint="legacy".zfill(64),
+                ),
+            )
+        )
+        db.commit()
+
+        rebuild_freight_reconciliations(db)
+        db.commit()
+
+        assert db.get(FreightCte, supplemental.erp_cte_id) is not None
+        assert db.scalar(
+            select(FreightCteInvoice).where(FreightCteInvoice.erp_cte_id == supplemental.erp_cte_id)
+        ) is not None
+        assert db.scalar(
+            select(FreightReconciliation).where(
+                FreightReconciliation.erp_cte_id == supplemental.erp_cte_id
+            )
+        ) is None
+
+
 def test_cte_2426_suggests_only_nf_4200716_and_admin_confirmation_is_audited():
     Base.metadata.create_all(engine)
     with SessionLocal() as db:

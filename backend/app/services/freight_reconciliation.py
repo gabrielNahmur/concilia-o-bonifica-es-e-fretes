@@ -6,7 +6,7 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.models import (
@@ -545,6 +545,27 @@ def rebuild_freight_reconciliations(db: Session) -> int:
     purchases_by_id = {purchase.erp_entry_id: purchase for purchase in purchases}
     used = _document_links(db, ctes, purchases)
     db.flush()
+
+    # Model-57 entries may be received as isolated "freight expense without
+    # purchases" documents.  They remain in the raw ERP snapshot, but are
+    # outside the fuel-freight scope unless the deterministic matcher proved a
+    # link to at least one fuel purchase.  Deleting any old materialization is
+    # important: otherwise a historical expense would remain visible forever.
+    out_of_scope_ids = {
+        cte.erp_cte_id
+        for cte in ctes
+        if cte.source_kind == "purchase_entry" and not used.get(cte.erp_cte_id)
+    }
+    if out_of_scope_ids:
+        db.execute(
+            delete(FreightReconciliation).where(
+                FreightReconciliation.erp_cte_id.in_(out_of_scope_ids)
+            )
+        )
+        ctes = [cte for cte in ctes if cte.erp_cte_id not in out_of_scope_ids]
+    if not ctes:
+        db.flush()
+        return 0
 
     mcte_ids = [cte.erp_cte_id for cte in ctes if cte.source_kind == "mcte"]
     entry_ids = [cte.source_entry_id for cte in ctes if cte.source_entry_id is not None]
