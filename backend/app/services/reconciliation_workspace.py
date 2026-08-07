@@ -1228,9 +1228,13 @@ def _enforce_evidence_capacity(db: Session, today: date) -> None:
     evidence_rows = db.scalars(select(ReconciliationEvidence).where(ReconciliationEvidence.counted.is_(True))).all()
     for evidence in evidence_rows:
         allocations = db.scalars(
-            select(ReconciliationAllocation).where(
+            select(ReconciliationAllocation)
+            .join(ReconciliationItem, ReconciliationItem.id == ReconciliationAllocation.item_id)
+            .join(Reconciliation, Reconciliation.id == ReconciliationItem.reconciliation_id)
+            .where(
                 ReconciliationAllocation.evidence_id == evidence.id,
                 ReconciliationAllocation.allocated_value > 0,
+                Reconciliation.status != "superseded",
             )
         ).all()
         total = sum((_decimal(item.allocated_value) for item in allocations), Decimal("0"))

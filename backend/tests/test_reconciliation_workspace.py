@@ -620,6 +620,53 @@ def test_same_bank_evidence_cannot_auto_confirm_two_competencies():
         ) is not None
 
 
+def test_superseded_competency_does_not_consume_evidence_capacity():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(select(BonusRule).where(BonusRule.unit_code == "054", BonusRule.kind == "bank_deposit"))
+        evidence = json.dumps(
+            [{"source": "MExtratoBancoLanc", "id": "superseded-bank", "date": "2026-03-20", "value": 100.0}]
+        )
+        superseded = Reconciliation(
+            unit_code="054",
+            rule_id=rule.id,
+            reference_month=date(2026, 1, 1),
+            due_date=date(2026, 3, 20),
+            expected_value=Decimal("100"),
+            observed_value=Decimal("100"),
+            manual_adjustment=Decimal("0"),
+            difference_value=Decimal("0"),
+            status="pending",
+            confidence="direct",
+            evidence_json=evidence,
+        )
+        active = Reconciliation(
+            unit_code="054",
+            rule_id=rule.id,
+            reference_month=date(2026, 2, 1),
+            due_date=date(2026, 3, 20),
+            expected_value=Decimal("100"),
+            observed_value=Decimal("100"),
+            manual_adjustment=Decimal("0"),
+            difference_value=Decimal("0"),
+            status="pending",
+            confidence="direct",
+            evidence_json=evidence,
+        )
+        db.add_all([superseded, active])
+        db.flush()
+        rebuild_reconciliation_workspace(db, date(2026, 7, 10))
+
+        superseded.status = "superseded"
+        rebuild_reconciliation_workspace(db, date(2026, 7, 10))
+        active_item = db.scalar(select(ReconciliationItem).where(ReconciliationItem.reconciliation_id == active.id))
+
+        assert active_item.status == "auto_confirmed"
+        assert active.status == "confirmed"
+
+
 def test_unclassified_residual_blocks_automatic_invoice_confirmation():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
