@@ -45,6 +45,25 @@ from app.scripts.apply_unit_001_mar_2025_management_adjustment import (
 )
 
 
+def test_texaco_invoice_discount_rules_include_all_contract_fuel_codes():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rules = db.execute(
+            select(BonusRule).where(
+                BonusRule.unit_code.in_(("005", "007", "014")),
+                BonusRule.kind == "invoice_discount",
+            )
+        ).scalars().all()
+
+        assert {rule.unit_code: rule.applies_to for rule in rules} == {
+            "005": "fuel_codes:1,2,3,4,5,9",
+            "007": "fuel_codes:1,2,3,4,5,9",
+            "014": "fuel_codes:1,2,3,4,5,9",
+        }
+
+
 def _invoice_chain(db: Session, with_exact_6204: bool = True):
     purchase = Purchase(
         erp_entry_id=88001,
