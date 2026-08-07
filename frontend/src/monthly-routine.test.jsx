@@ -107,4 +107,11 @@ describe("monthly routine cumulative card", () => {
     expect(screen.getByText(/Créditos emitidos até 28\/06\/2026/)).toBeInTheDocument();
     expect(screen.queryByText(/26\/06\/2027/)).not.toBeInTheDocument();
   });
+
+  it("identifies an Ipiranga confirmation backed by an imported statement", async () => {
+    render(<MemoryRouter><MonthlyRoutine user={{ id: "viewer", role: "viewer" }} /></MemoryRouter>);
+
+    expect(await screen.findByText("Extrato importado")).toBeInTheDocument();
+    expect(screen.queryByText("Automático")).not.toBeInTheDocument();
+  });
 });

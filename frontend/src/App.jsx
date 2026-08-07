@@ -3166,6 +3166,13 @@ const routineSituationMeta = {
   awaiting_statement: { title: "Aguardando próximo extrato", badge: "pending" },
 };
 
+function routineCardBadgeLabel(card, fallback) {
+  if (card.situation === "automatic" && card.source_type === "ipiranga_portal" && card.latest_import) {
+    return "Extrato importado";
+  }
+  return card.confirmation_mode === "automatic" && card.situation === "automatic" ? "Automático" : fallback;
+}
+
 function RaizenReceiptAllocation({ receipt, onSaved }) {
   const [selected, setSelected] = useState([]);
   const [busy, setBusy] = useState(false);
@@ -3278,7 +3285,7 @@ export function MonthlyRoutine({ user }) {
         return <section className="routine-section" key={group}>
           <div className="section-title"><div><h3>{meta.title}</h3><p>{subtitle}</p></div><Badge status={meta.badge}>{rows.length}</Badge></div>
           {rows.length ? <div className="routine-card-grid">{rows.map((card) => <article className={`routine-card routine-${card.situation}`} key={card.id}>
-            <header><div className="routine-card-unit"><span className="routine-unit-code">{card.unit_code}</span><BrandLogo brand={card.brand || card.company_code} compact /><div><strong>{unitName({ display_name: card.unit_name }, `Unidade ${card.unit_code}`)}</strong><span>{card.company_code} • {card.rule_label}</span></div></div><Badge status={meta.badge}>{card.confirmation_mode === "automatic" && card.situation === "automatic" ? "Automático" : meta.title}</Badge></header>
+            <header><div className="routine-card-unit"><span className="routine-unit-code">{card.unit_code}</span><BrandLogo brand={card.brand || card.company_code} compact /><div><strong>{unitName({ display_name: card.unit_name }, `Unidade ${card.unit_code}`)}</strong><span>{card.company_code} • {card.rule_label}</span></div></div><Badge status={meta.badge}>{routineCardBadgeLabel(card, meta.title)}</Badge></header>
             <div className="routine-card-values"><div><span>{card.cumulative ? "Esperado acumulado" : "Esperado"}</span><strong>{money(card.expected_value)}</strong></div><div><span>{card.cumulative ? "Créditos apropriados" : "Identificado"}</span><strong>{money(card.observed_value)}</strong></div><div className={Math.abs(Number(card.difference_value || 0)) > 0.01 ? "negative" : ""}><span>{card.cumulative ? "Saldo efetivo" : "Diferença"}</span><strong>{money(card.difference_value)}</strong></div></div>
             {card.cumulative && <div className="routine-cumulative-note">
               <span>Até {d(card.as_of_date)} • <strong>{n(card.credit_event_count)} crédito(s) postecipado(s) no portal</strong></span>
