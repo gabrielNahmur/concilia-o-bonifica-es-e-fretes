@@ -41,6 +41,7 @@ from app.services.management_adjustments import (
 
 ZERO = Decimal("0")
 RAIZEN_RECEIPT_CATEGORY = "raizen_bank_receipt"
+NEXT_MONTH_IPIRANGA_PORTAL_UNITS = frozenset({"003", "004"})
 COMPANY_TERMS = {
     "BR": ("VIBRA", "PETROBRAS", "BR DISTRIBUIDORA"),
     "SHELL": ("RAIZEN", "RAÍZEN", "SHELL"),
@@ -704,6 +705,59 @@ def _portal_credit_pool(db: Session, rule: BonusRule, until: date) -> list[dict]
             }
         )
     return pool
+
+
+def uses_next_month_ipiranga_portal_credit(rule: BonusRule) -> bool:
+    """Return whether the portal issue month defines this rule's competence.
+
+    Units 003 and 004 have an approved operational rule: a postpaid Ipiranga
+    credit issued in calendar month M+1 is compared with purchases from M.
+    The association is date-based, so it must never use FIFO, an exact-value
+    reservation, or an inferred purchase cycle.
+    """
+    return (
+        rule.kind == "distributor_credit"
+        and rule.company_code == "IPIRANGA"
+        and rule.unit_code in NEXT_MONTH_IPIRANGA_PORTAL_UNITS
+    )
+
+
+def _next_month_ipiranga_portal_credit_evidence(
+    pool: list[dict], reference_month: date, due: date
+) -> tuple[Decimal, list[dict]]:
+    """Return every postpaid credit issued in the month after a competence."""
+    credit_month = add_months(month_start(reference_month), 1)
+    credit_month_end = add_months(credit_month, 1)
+    credits = [item for item in pool if credit_month <= item["date"] < credit_month_end]
+    observed = money(sum((money(item.get("raw_value", ZERO)) for item in credits), ZERO))
+    evidence = [
+        {
+            "source": "IPIRANGA_PORTAL",
+            "id": item["id"],
+            "date": item["date"].isoformat(),
+            "document": item.get("document"),
+            "value": float(money(item.get("raw_value", ZERO))),
+            "source_value": float(money(item.get("raw_value", ZERO))),
+            "allocated": float(money(item.get("raw_value", ZERO))),
+            "after_due_date": item["date"] > due,
+            "allocation_reason": (
+                "Regra mensal das unidades 003/004: crédito postecipado emitido no mês seguinte "
+                f"em {credit_month.strftime('%m/%Y')} é confrontado com a competência "
+                f"de {month_start(reference_month).strftime('%m/%Y')}, sem rateio por valor ou NF."
+            ),
+            "portal_event_key": item.get("portal_event_key"),
+            "portal_match_status": item.get("portal_match_status"),
+            "invoice_number": item.get("invoice_number"),
+            "purchase_entry_id": item.get("purchase_entry_id"),
+            "financial_entry_id": item.get("financial_entry_id"),
+            "match_basis": (
+                "Extrato Ipiranga: Bonificação Postecipada emitida no mês seguinte "
+                "à competência contratual."
+            ),
+        }
+        for item in credits
+    ]
+    return observed, evidence
 
 
 def _unit_004_unique_portal_cycle_allocations(
@@ -1413,26 +1467,17 @@ def _upsert(
 def _rebuild_monthly_rule(db: Session, rule: BonusRule, today: date) -> int:
     count = 0
     months = list(_months(rule.effective_from, min(today, rule.effective_to or today)))
-    # Unit 004 uses the accumulated portal statement as primary proof.  The
-    # source names the NF where a credit was used, but does not say which
-    # purchase generated it; never create an inferred purchase-cycle match.
-    unit_004_cycle_allocations: dict[int, list[dict]] = {}
-    use_unit_004_nf_cycles = False
-    is_unit_004_portal_credit = (
-        rule.unit_code == "004"
-        and rule.company_code == "IPIRANGA"
-        and rule.kind == "distributor_credit"
-    )
+    next_month_portal_rule = uses_next_month_ipiranga_portal_credit(rule)
     if rule.kind == "distributor_credit":
         portal_pool = (
             _portal_credit_pool(db, rule, today)
             if rule.company_code == "IPIRANGA" and rule.unit_code != "001"
             else []
         )
-        # Unidade 003: a prova aprovada é exclusivamente a emissão do crédito
-        # no extrato Ipiranga. Descontos MDCMP continuam no ERP para auditoria,
-        # mas não podem confirmar nem complementar a bonificação contratual.
-        portal_primary = rule.company_code == "IPIRANGA" and rule.unit_code in {"003", "004"}
+        # Unidades 003/004: a prova aprovada é exclusivamente a emissão do
+        # crédito no extrato Ipiranga. Descontos MDCMP continuam no ERP para
+        # auditoria, mas não podem confirmar nem complementar a bonificação.
+        portal_primary = next_month_portal_rule
         pool = portal_pool if portal_primary else portal_pool or _contract_credit_pool(db, rule, today)
     elif rule.kind == "s10_excess_credit":
         pool = _s10_residual_credit_pool(db, rule, today)
@@ -1455,7 +1500,9 @@ def _rebuild_monthly_rule(db: Session, rule: BonusRule, today: date) -> int:
                 "due": due_date_for_month(reference_month, rule.due_month_offset, rule.due_day),
             }
         )
-    exact_portal_reservations = _reserve_exact_postpaid_portal_credits(pool, month_specs, rule)
+    exact_portal_reservations = (
+        {} if next_month_portal_rule else _reserve_exact_postpaid_portal_credits(pool, month_specs, rule)
+    )
     used_evidence: set[str] = set()
     for spec in month_specs:
         reference_month = spec["reference_month"]
@@ -1468,36 +1515,17 @@ def _rebuild_monthly_rule(db: Session, rule: BonusRule, today: date) -> int:
             observed, evidence = _document_discounts_capped(db, rule, entry_ids)
             confidence = "direct" if observed > ZERO and any(item.get("source") == "MDCMP" for item in evidence) else "none"
         elif rule.kind == "distributor_credit":
-            if is_unit_004_portal_credit:
-                observed = ZERO
-                evidence = []
-            elif use_unit_004_nf_cycles:
-                evidence = [
-                    payload
-                    for entry_id in entry_ids
-                    for payload in unit_004_cycle_allocations.get(entry_id, [])
-                ]
-                observed = money(sum(
-                    (Decimal(str(payload.get("allocated") or 0)) for payload in evidence),
-                    ZERO,
-                ))
+            if next_month_portal_rule:
+                observed, evidence = _next_month_ipiranga_portal_credit_evidence(
+                    pool, reference_month, due
+                )
             else:
                 observed = ZERO
                 evidence = []
             available_from = month_start(reference_month)
-            if not is_unit_004_portal_credit and not use_unit_004_nf_cycles and reference_month in exact_portal_reservations:
+            if not next_month_portal_rule and reference_month in exact_portal_reservations:
                 observed, evidence = exact_portal_reservations[reference_month]
-            elif not is_unit_004_portal_credit and not use_unit_004_nf_cycles and rule.company_code == "IPIRANGA" and rule.unit_code in {"003", "004"}:
-                # The unit 004 portal report does not identify a competence.
-                # Keep its credits auditable, but do not close historical
-                # months using a chronological wallet hypothesis.
-                observed = ZERO
-                evidence = _unassigned_portal_credit_evidence(
-                    pool,
-                    add_months(month_start(reference_month), 1),
-                    due,
-                )
-            elif not use_unit_004_nf_cycles:
+            elif not next_month_portal_rule:
                 observed, evidence = _consume_fifo_windowed(pool, expected, due, available_from)
             # O crédito permanece auditável. Quando a origem inteira tem o
             # mesmo valor da competência, a política do workspace o confirma.

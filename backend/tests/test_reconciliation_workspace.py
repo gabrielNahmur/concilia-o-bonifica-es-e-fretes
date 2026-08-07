@@ -845,8 +845,8 @@ def test_unit_004_does_not_materialize_an_inferred_portal_cycle_per_nf():
         assert all(item.status != "auto_confirmed" for item in ambiguous)
 
 
-def test_unit_004_materializes_portal_credit_not_each_purchase_nf():
-    """The portal proves the credit used, not an inferred origin purchase cycle."""
+def test_unit_004_assigns_a_portal_credit_to_the_previous_competence_not_to_an_nf():
+    """The 004 calendar rule preserves the portal value even when it differs."""
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -885,10 +885,19 @@ def test_unit_004_materializes_portal_credit_not_each_purchase_nf():
         items = db.scalars(
             select(ReconciliationItem).where(ReconciliationItem.source_document.in_(("40001", "40002")))
         ).all()
-        assert [(item.item_type, item.source_document, item.expected_value, item.observed_value) for item in items] == [
-            ("portal_credit_usage", "40002", Decimal("8750.00"), Decimal("8750.00")),
-        ]
-        assert items[0].status == "auto_confirmed"
+        assert items == []
+
+        october = db.scalar(
+            select(Reconciliation).where(
+                Reconciliation.unit_code == "004",
+                Reconciliation.reference_month == date(2025, 10, 1),
+            )
+        )
+        assert october is not None
+        assert october.expected_value == Decimal("3500.00")
+        assert october.observed_value == Decimal("8750.00")
+        assert october.difference_value == Decimal("-5250.00")
+        assert october.status == "divergent"
 
 
 def test_full_management_adjustment_hides_rejected_automatic_evidence_from_workspace():

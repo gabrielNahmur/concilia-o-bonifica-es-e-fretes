@@ -409,7 +409,7 @@ def test_br_umbrella_marks_exact_vibra_receipt_as_automatic_and_auditable():
         assert receipt["before_period_close"] is False
 
 
-def test_unit_004_confirms_direct_portal_usage_without_cycle_inference():
+def test_unit_004_uses_next_month_rule_even_when_portal_declares_the_used_invoice():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -472,15 +472,113 @@ def test_unit_004_confirms_direct_portal_usage_without_cycle_inference():
         rule = db.scalar(
             select(BonusRule).where(BonusRule.unit_code == "004", BonusRule.kind == "distributor_credit")
         )
-        items = db.scalars(
-            select(ReconciliationItem).where(ReconciliationItem.item_type == "portal_credit_usage")
-        ).all()
-        assert [(item.source_document, item.expected_value, item.observed_value, item.status) for item in items] == [
-            ("9402", Decimal("1400.00"), Decimal("1400.00"), "auto_confirmed"),
-        ]
+        september = db.scalar(
+            select(Reconciliation).where(
+                Reconciliation.rule_id == rule.id,
+                Reconciliation.reference_month == date(2025, 9, 1),
+            )
+        )
+        item = db.scalar(
+            select(ReconciliationItem).where(ReconciliationItem.reconciliation_id == september.id)
+        )
+        assert (september.expected_value, september.observed_value, september.difference_value) == (
+            Decimal("700.00"), Decimal("1400.00"), Decimal("-700.00")
+        )
+        assert (item.item_type, item.source_document, item.status) == (
+            "distributor_credit", None, "divergent"
+        )
+        assert json.loads(september.evidence_json)[0]["date"] == "2025-10-17"
         assert db.scalars(
             select(ReconciliationItem).where(ReconciliationItem.item_type == "portal_cycle_invoice")
         ).all() == []
+
+
+def test_units_003_and_004_assign_postpaid_portal_credits_to_the_previous_month():
+    """A different portal amount must remain a monthly discrepancy, not be reallocated."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        db.add_all(
+            [
+                Purchase(
+                    erp_entry_id=99301,
+                    unit_code="003",
+                    supplier_name="IPIRANGA PRODUTOS",
+                    supplier_cnpj="33337122015906",
+                    mapped_company_code="IPIRANGA",
+                    invoice_number="99301",
+                    purchase_date=date(2026, 4, 15),
+                    total_liters=Decimal("90000"),
+                    s10_liters=Decimal("0"),
+                    gross_value=Decimal("1"),
+                    net_value=Decimal("1"),
+                ),
+                Purchase(
+                    erp_entry_id=99401,
+                    unit_code="004",
+                    supplier_name="IPIRANGA PRODUTOS",
+                    supplier_cnpj="33337122015906",
+                    mapped_company_code="IPIRANGA",
+                    invoice_number="99401",
+                    purchase_date=date(2026, 6, 15),
+                    total_liters=Decimal("110000"),
+                    s10_liters=Decimal("0"),
+                    gross_value=Decimal("1"),
+                    net_value=Decimal("1"),
+                ),
+                PortalBonusEvent(
+                    id="portal-003-may-5580",
+                    event_key="portal-003-may-5580",
+                    unit_code="003",
+                    company_code="IPIRANGA",
+                    category="postpaid",
+                    portal_date=date(2026, 5, 7),
+                    value=Decimal("5580.00"),
+                    description="Bonificação Postecipada",
+                ),
+                PortalBonusEvent(
+                    id="portal-004-jul-7350",
+                    event_key="portal-004-jul-7350",
+                    unit_code="004",
+                    company_code="IPIRANGA",
+                    category="postpaid",
+                    portal_date=date(2026, 7, 16),
+                    value=Decimal("7350.00"),
+                    description="Bonificação Postecipada",
+                ),
+            ]
+        )
+        db.flush()
+
+        rebuild_reconciliations(db, today=date(2026, 8, 7))
+
+        rule_003 = db.scalar(select(BonusRule).where(BonusRule.unit_code == "003"))
+        april_003 = db.scalar(
+            select(Reconciliation).where(
+                Reconciliation.rule_id == rule_003.id,
+                Reconciliation.reference_month == date(2026, 4, 1),
+            )
+        )
+        rule_004 = db.scalar(select(BonusRule).where(BonusRule.unit_code == "004"))
+        june_004 = db.scalar(
+            select(Reconciliation).where(
+                Reconciliation.rule_id == rule_004.id,
+                Reconciliation.reference_month == date(2026, 6, 1),
+            )
+        )
+
+        assert (april_003.expected_value, april_003.observed_value, april_003.difference_value) == (
+            Decimal("5400.00"), Decimal("5580.00"), Decimal("-180.00")
+        )
+        assert (june_004.expected_value, june_004.observed_value, june_004.difference_value) == (
+            Decimal("7700.00"), Decimal("7350.00"), Decimal("350.00")
+        )
+        april_evidence = json.loads(april_003.evidence_json)
+        june_evidence = json.loads(june_004.evidence_json)
+        assert april_evidence[0]["date"] == "2026-05-07"
+        assert june_evidence[0]["date"] == "2026-07-16"
+        assert "mês seguinte" in april_evidence[0]["allocation_reason"]
 
 
 def test_probable_match_requires_review_even_when_values_are_equal():

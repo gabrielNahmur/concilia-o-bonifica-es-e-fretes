@@ -22,7 +22,10 @@ from app.models import (
     ReconciliationException,
     ReconciliationItem,
 )
-from app.services.reconciliation import invoice_discount_forfeited_by_late_payment
+from app.services.reconciliation import (
+    invoice_discount_forfeited_by_late_payment,
+    uses_next_month_ipiranga_portal_credit,
+)
 from app.services.rules import money, month_end, month_start, reconciliation_status
 from app.services.unit_004_portal_usage import (
     is_unit_004_portal_credit_rule,
@@ -31,7 +34,7 @@ from app.services.unit_004_portal_usage import (
 from app.services.management_adjustments import full_management_adjustment
 
 
-ALGORITHM_VERSION = "value-evid-v3.9-004portal"
+ALGORITHM_VERSION = "value-evid-v4.1-ipg-month"
 # Valores já chegam quantizados em centavos. A política aprovada considera a
 # conciliação concluída quando as evidências vinculadas fecham exatamente o
 # valor esperado; os elos técnicos disponíveis seguem exibidos para auditoria.
@@ -398,11 +401,9 @@ def _base_item_payloads(db: Session, row: Reconciliation, rule: BonusRule):
     # A full historical management adjustment is an audited scope decision,
     # not a financial proof. Do not materialize a stale automatic item whose
     # rejected portal allocations would make the confirmed total misleading.
-    if full_management_adjustment(db, row):
+    if full_management_adjustment(db, row) and not uses_next_month_ipiranga_portal_credit(rule):
         return []
     raw_evidence = _evidence_for_rule(rule, json.loads(row.evidence_json or "[]"))
-    if is_unit_004_portal_credit_rule(rule):
-        return _unit_004_portal_usage_payloads(db, row, rule)
     if rule.kind != "invoice_discount":
         # A zero/zero month carries no financial action.  It is deliberately
         # absent from the operational queue rather than labelled as pending.
@@ -677,6 +678,12 @@ def _automatic_policy(rule: BonusRule, item_payload: dict, observed: Decimal) ->
             False,
             "Credito listado no portal Ipiranga, mas sem competencia explicita; aguarda a identificacao da distribuidora e nao e apropriado automaticamente.",
         )
+    if uses_next_month_ipiranga_portal_credit(rule) and not exact:
+        return (
+            False,
+            "O crédito postecipado do extrato Ipiranga foi emitido no mês seguinte, "
+            "mas o valor não fecha a bonificação esperada desta competência.",
+        )
     if not exact:
         return False, "O valor identificado não fecha exatamente o valor esperado deste item."
     if not counted:
@@ -787,6 +794,14 @@ def _item_status(
         return "not_applicable"
     if automatic:
         return "auto_confirmed"
+    if (
+        uses_next_month_ipiranga_portal_credit(rule)
+        and any(item.get("source") == "IPIRANGA_PORTAL" for item in payload.get("evidence", []))
+        and abs(expected - observed) > CENT_TOLERANCE
+    ):
+        # Há prova direta do valor liberado; a diferença é de valor, não uma
+        # ausência de extrato nem apenas um vencimento sem pagamento.
+        return "divergent"
     if (
         rule.kind == "distributor_credit"
         and rule.unit_code in {"003", "004"}

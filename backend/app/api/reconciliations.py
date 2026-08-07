@@ -29,7 +29,6 @@ from app.services.reconciliation_detail import build_reconciliation_detail
 from app.services.reconciliation_workspace import recompute_reconciliation_confirmation
 from app.services.reconciliation_workspace import CONTRACTUAL_EXCLUSION_REVIEW_STATUS
 from app.services.rules import money, reconciliation_status
-from app.services.unit_004_portal_usage import is_unit_004_portal_credit_rule
 from app.services.uploads import UploadValidationError, read_validated_upload
 
 
@@ -614,13 +613,10 @@ def reconciliation_work_queue(
             continue
         # A few legacy invoice reconciliations predate granular items. Keep
         # them visible as one aggregate line instead of silently losing them
-        # from the operational queue. Unit 004 is deliberately different: its
-        # approved proof is the accumulated Ipiranga statement, so only a
-        # portal credit explicitly declared by Ipiranga can enter this queue.
+        # from the operational queue. Distributor-credit rules are always
+        # represented by their contractual competence, never by a usage NF.
         if rule.kind == "invoice_discount":
             source_items = items_by_reconciliation.get(reconciliation.id) or [None]
-        elif is_unit_004_portal_credit_rule(rule):
-            source_items = items_by_reconciliation.get(reconciliation.id) or []
         else:
             source_items = [None]
         for item in source_items:

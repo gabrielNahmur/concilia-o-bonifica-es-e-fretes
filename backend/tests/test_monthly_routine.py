@@ -85,10 +85,10 @@ def test_monthly_routine_aggregates_ipiranga_statement_units_once_per_rule():
                     reference_month=date(2026, 4, 1),
                     due_date=date(2026, 5, 31),
                     expected_value=Decimal("300.00"),
-                    observed_value=Decimal("0.00"),
-                    difference_value=Decimal("300.00"),
-                    status="pending",
-                    confidence="none",
+                    observed_value=Decimal("300.00"),
+                    difference_value=Decimal("0.00"),
+                    status="confirmed",
+                    confidence="direct",
                 ),
                 Reconciliation(
                     unit_code="003",
@@ -96,10 +96,10 @@ def test_monthly_routine_aggregates_ipiranga_statement_units_once_per_rule():
                     reference_month=date(2026, 5, 1),
                     due_date=date(2026, 6, 30),
                     expected_value=Decimal("420.00"),
-                    observed_value=Decimal("0.00"),
-                    difference_value=Decimal("420.00"),
-                    status="pending",
-                    confidence="none",
+                    observed_value=Decimal("420.00"),
+                    difference_value=Decimal("0.00"),
+                    status="confirmed",
+                    confidence="direct",
                 ),
                 PortalBonusEvent(
                     id="portal-003-apr",
@@ -136,7 +136,7 @@ def test_monthly_routine_aggregates_ipiranga_statement_units_once_per_rule():
                 source_document=None,
                 description=f"Competência {row.reference_month.isoformat()}",
                 expected_value=row.expected_value,
-                observed_value=Decimal("0.00"),
+                    observed_value=Decimal("0.00"),
                 difference_value=row.expected_value,
                 status="pending",
                 confidence="none",
@@ -237,6 +237,72 @@ def test_monthly_routine_aggregates_ipiranga_statement_units_once_per_rule():
         assert cards[0]["imports"][0]["original_filename"] == "extrato-003.pdf"
 
 
+def test_monthly_routine_004_keeps_the_next_month_credit_as_the_identified_value():
+    """A short July credit must remain visible against the June competence."""
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = _rule(db, "004", "distributor_credit")
+        reconciliation = Reconciliation(
+            unit_code="004",
+            rule_id=rule.id,
+            reference_month=date(2026, 6, 1),
+            due_date=date(2026, 7, 31),
+            expected_value=Decimal("7700.00"),
+            observed_value=Decimal("7350.00"),
+            difference_value=Decimal("350.00"),
+            status="divergent",
+            confidence="direct",
+        )
+        db.add_all(
+            [
+                reconciliation,
+                PortalBonusEvent(
+                    id="portal-004-jul-7350",
+                    event_key="portal-004-jul-7350",
+                    unit_code="004",
+                    company_code="IPIRANGA",
+                    category="postpaid",
+                    portal_date=date(2026, 7, 16),
+                    value=Decimal("7350.00"),
+                    description="Bonificação Postecipada",
+                ),
+                PortalStatementImport(
+                    unit_code="004",
+                    company_code="IPIRANGA",
+                    category="postpaid",
+                    client_cnpj="90589698000468",
+                    period_start=date(2026, 7, 1),
+                    period_end=date(2026, 7, 31),
+                    original_filename="extrato-004-julho.pdf",
+                    content_type="application/pdf",
+                    content_sha256="d" * 64,
+                    source_file=b"source",
+                    row_count=1,
+                    imported_count=1,
+                    duplicate_count=0,
+                    uploaded_by="admin",
+                    created_at=datetime.now(timezone.utc),
+                ),
+            ]
+        )
+        db.commit()
+
+        payload = build_monthly_routine(
+            db, reference_months=[date(2026, 6, 1)], today=date(2026, 8, 7)
+        )
+        card = next(row for row in payload["cards"] if row["unit_code"] == "004")
+
+        assert card["expected_value"] == 7700.0
+        assert card["observed_value"] == 7350.0
+        assert card["difference_value"] == 350.0
+        assert card["portal_appropriated_value"] == 7350.0
+        assert card["portal_credit_total_value"] == 7350.0
+        assert card["portal_unallocated_value"] == 0.0
+        assert card["situation"] == "analysis"
+
+
 def test_monthly_routine_cumulative_includes_audited_historical_adjustment_in_observed_total():
     """The operational total includes an audited adjustment without inflating portal credit."""
     engine = create_engine("sqlite:///:memory:")
@@ -251,11 +317,11 @@ def test_monthly_routine_cumulative_includes_audited_historical_adjustment_in_ob
                 reference_month=date(2026, month, 1),
                 due_date=date(2026, month, 28),
                 expected_value=Decimal("100.00"),
-                observed_value=Decimal("0.00"),
-                manual_adjustment=Decimal("100.00") if month == 4 else Decimal("0.00"),
-                difference_value=Decimal("0.00") if month == 4 else Decimal("100.00"),
-                status="confirmed" if month == 4 else "pending",
-                confidence="direct" if month == 4 else "none",
+                    observed_value=Decimal("100.00") if month in (5, 6) else Decimal("0.00"),
+                    manual_adjustment=Decimal("100.00") if month == 4 else Decimal("0.00"),
+                difference_value=Decimal("0.00"),
+                status="confirmed",
+                confidence="direct",
             )
             for month in (4, 5, 6)
         ]
@@ -660,13 +726,26 @@ def test_monthly_routine_marks_unpaid_invoice_remainder_as_awaiting_settlement()
         assert "state=waiting" in card["queue_url"]
 
 
-def test_monthly_routine_004_separates_historical_residual_from_next_statement():
+def test_monthly_routine_004_includes_an_audited_adjustment_without_reassigning_portal_credit():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
         seed_reference_data(db)
+        rule = _rule(db, "004", "distributor_credit")
         db.add_all(
             [
+                Reconciliation(
+                    unit_code="004",
+                    rule_id=rule.id,
+                    reference_month=date(2026, 6, 1),
+                    due_date=date(2026, 7, 31),
+                    expected_value=Decimal("78540.00"),
+                    observed_value=Decimal("78470.01"),
+                    manual_adjustment=Decimal("69.99"),
+                    difference_value=Decimal("0.00"),
+                    status="confirmed",
+                    confidence="direct",
+                ),
                 Purchase(
                     erp_entry_id=400001,
                     unit_code="004",
@@ -726,10 +805,10 @@ def test_monthly_routine_004_separates_historical_residual_from_next_statement()
         card = next(row for row in payload["cards"] if row["unit_code"] == "004")
 
         assert card["historical_adjustment_value"] == 69.99
-        assert card["next_statement_expected_value"] == 700.0
+        assert card["next_statement_expected_value"] == 0.0
         assert card["observed_value"] == 78540.0
         assert card["portal_appropriated_value"] == 78470.01
-        assert card["situation"] == "awaiting_statement"
+        assert card["situation"] == "automatic"
 
 
 def test_monthly_routine_uses_one_unit_004_card_when_no_source_has_been_imported():

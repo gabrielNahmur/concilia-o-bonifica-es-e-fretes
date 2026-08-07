@@ -182,8 +182,8 @@ def test_work_queue_accepts_multiple_operational_states():
         assert {item["state"] for item in payload["items"]} == {"confirmed", "waiting"}
 
 
-def test_work_queue_004_uses_explicit_portal_credits_not_monthly_inferred_charges():
-    """Unit 004 has an accumulated portal statement, not a monthly credit attribution."""
+def test_work_queue_004_exposes_the_calendar_competence_and_portal_difference():
+    """Unit 004 shows the month that received the next-month portal credit."""
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -196,8 +196,8 @@ def test_work_queue_004_uses_explicit_portal_credits_not_monthly_inferred_charge
         )
         credited_month = Reconciliation(
             unit_code="004", rule_id=rule.id, reference_month=date(2026, 4, 1), due_date=date(2026, 5, 31),
-            expected_value=Decimal("7700"), observed_value=Decimal("0"), manual_adjustment=Decimal("0"),
-            difference_value=Decimal("7700"), status="overdue", confidence="none", evidence_json="[]",
+            expected_value=Decimal("7700"), observed_value=Decimal("7350"), manual_adjustment=Decimal("0"),
+            difference_value=Decimal("350"), status="divergent", confidence="direct", evidence_json="[]",
         )
         awaiting_statement = Reconciliation(
             unit_code="004", rule_id=rule.id, reference_month=date(2026, 6, 1), due_date=date(2026, 7, 31),
@@ -206,26 +206,6 @@ def test_work_queue_004_uses_explicit_portal_credits_not_monthly_inferred_charge
         )
         db.add_all((credited_month, awaiting_statement))
         db.flush()
-        db.add(
-            ReconciliationItem(
-                reconciliation_id=credited_month.id,
-                source_key="portal-usage:004-apr-2026",
-                item_type="portal_credit_usage",
-                source_date=date(2026, 4, 20),
-                source_document="3048889",
-                description="Crédito Ipiranga utilizado na NF 3048889",
-                expected_value=Decimal("8750"),
-                observed_value=Decimal("8750"),
-                difference_value=Decimal("0"),
-                status="auto_confirmed",
-                confidence="direct",
-                automatic_eligible=True,
-                review_status="pending",
-                policy_reason="Crédito declarado no portal.",
-                details_json='{"portal_credit_usage":true}',
-                fingerprint="portal-usage:004-apr-2026",
-            )
-        )
         db.flush()
 
         actionable = reconciliation_work_queue(
@@ -235,7 +215,9 @@ def test_work_queue_004_uses_explicit_portal_credits_not_monthly_inferred_charge
             db=db, _=None, unit="004", scope="confirmed", page=1, page_size=50,
         )
 
-        assert actionable["total"] == 0
-        assert [(item["document"], item["status"]) for item in confirmed["items"]] == [
-            ("3048889", "auto_confirmed"),
-        ]
+        assert actionable["total"] == 2
+        april = next(item for item in actionable["items"] if item["reference_month"] == date(2026, 4, 1))
+        assert (april["document"], april["expected_value"], april["observed_value"], april["difference_value"]) == (
+            None, 7700.0, 7350.0, 350.0
+        )
+        assert confirmed["total"] == 0

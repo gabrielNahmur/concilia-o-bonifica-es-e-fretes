@@ -23,12 +23,15 @@ from pypdf import PdfReader
 from sqlalchemy import select
 
 from app.dependencies import AdminUser, CurrentUser, DbSession
-from app.models import BonusRule, ManualAdjustment, PortalBonusEvent, PortalBonusEventSource, PortalStatementImport, Purchase, Reconciliation, ReconciliationAllocation, ReconciliationEvidence, ReconciliationItem, Unit, User
+from app.models import BonusRule, ManualAdjustment, PortalBonusEvent, PortalBonusEventSource, PortalStatementImport, Reconciliation, ReconciliationAllocation, ReconciliationEvidence, ReconciliationItem, Unit, User
 from app.services.audit import audit
 from app.services.ipiranga_portal import MAX_PORTAL_BYTES, PortalStatementError, import_ipiranga_statement
-from app.services.reconciliation import RAIZEN_RECEIPT_CATEGORY, rebuild_reconciliations
+from app.services.reconciliation import (
+    RAIZEN_RECEIPT_CATEGORY,
+    rebuild_reconciliations,
+    uses_next_month_ipiranga_portal_credit,
+)
 from app.services.rules import money, month_end
-from app.services.unit_004_portal_usage import is_unit_004_portal_credit_rule, unit_004_portal_usage_events
 from app.services.uploads import UploadValidationError, read_validated_upload
 
 
@@ -39,9 +42,6 @@ RAIZEN_UNIT = "054"
 RAIZEN_COMPANY = "SHELL"
 RAIZEN_PAYER_CNPJ = "033453598000123"
 RAIZEN_BENEFICIARY_CNPJ = "12564276000262"
-UNIT_004_HISTORICAL_PURCHASE_CUTOFF = date(2026, 5, 26)
-UNIT_004_HISTORICAL_CREDIT_CUTOFF = date(2026, 7, 16)
-UNIT_004_APPROVED_HISTORICAL_RESIDUAL = Decimal("69.99")
 
 RULE_LABELS = {
     "distributor_credit": "Crédito na distribuidora",
@@ -123,58 +123,6 @@ def _is_historical_exclusion_adjustment(adjustment: ManualAdjustment) -> bool:
     return "exclusao historica" in reason and "fora da conciliacao contratual" in reason
 
 
-def _unit_004_cumulative_snapshot(db: DbSession, rule: BonusRule, as_of: date, today: date) -> dict:
-    """Return the approved accumulated portal-statement view for unit 004."""
-    purchases = db.scalars(
-        select(Purchase).where(
-            Purchase.unit_code == rule.unit_code,
-            Purchase.mapped_company_code == rule.company_code,
-            Purchase.purchase_date >= rule.effective_from,
-            Purchase.purchase_date <= as_of,
-        )
-    ).all()
-    rate = Decimal(rule.rate_per_liter)
-    total_expected = money(sum((Decimal(row.total_liters or 0) * rate for row in purchases), ZERO))
-    historical_expected = money(
-        sum(
-            (
-                Decimal(row.total_liters or 0) * rate
-                for row in purchases
-                if row.purchase_date <= UNIT_004_HISTORICAL_PURCHASE_CUTOFF
-            ),
-            ZERO,
-        )
-    )
-    usage = [entry for entry in unit_004_portal_usage_events(db, rule) if entry.event.portal_date <= today]
-    confirmed_credits = money(sum((Decimal(entry.event.value or 0) for entry in usage), ZERO))
-    historical_credits = money(
-        sum(
-            (
-                Decimal(entry.event.value or 0)
-                for entry in usage
-                if entry.event.portal_date <= UNIT_004_HISTORICAL_CREDIT_CUTOFF
-            ),
-            ZERO,
-        )
-    )
-    historical_residual = money(historical_expected - historical_credits)
-    later_expected = money(max(ZERO, total_expected - historical_expected))
-    later_credits = money(max(ZERO, confirmed_credits - historical_credits))
-    awaiting_statement = money(max(ZERO, later_expected - later_credits))
-    residual_is_approved = abs(historical_residual - UNIT_004_APPROVED_HISTORICAL_RESIDUAL) <= Decimal("0.01")
-    return {
-        "expected": total_expected,
-        "identified": confirmed_credits,
-        "difference": money(total_expected - confirmed_credits),
-        "historical_expected": historical_expected,
-        "historical_identified": historical_credits,
-        "historical_adjustment": historical_residual,
-        "historical_adjustment_approved": residual_is_approved,
-        "next_statement_expected": awaiting_statement,
-        "credit_count": len(usage),
-    }
-
-
 def _normalized(value: str | None) -> str:
     return "".join(
         char for char in unicodedata.normalize("NFKD", value or "").upper() if not unicodedata.combining(char)
@@ -243,40 +191,25 @@ def _ipiranga_cumulative_card(
     historical_adjustment = ZERO
     next_statement_expected = ZERO
 
-    if is_unit_004_portal_credit_rule(rule):
-        snapshot = _unit_004_cumulative_snapshot(db, rule, as_of, today)
-        expected = snapshot["expected"]
-        identified = snapshot["identified"]
-        historical_adjustment = (
-            snapshot["historical_adjustment"]
-            if snapshot["historical_adjustment_approved"]
-            else ZERO
+    expected = money(sum((Decimal(row.expected_value or 0) for row in rows), ZERO))
+    events = db.scalars(
+        select(PortalBonusEvent)
+        .where(
+            PortalBonusEvent.unit_code == rule.unit_code,
+            PortalBonusEvent.company_code == rule.company_code,
+            PortalBonusEvent.category == "postpaid",
+            PortalBonusEvent.portal_date <= today,
         )
-        next_statement_expected = snapshot["next_statement_expected"]
-        credit_event_count = snapshot["credit_count"]
-        credit_history = [
-            {
-                "date": entry.event.portal_date,
-                "value": float(money(Decimal(entry.event.value or 0))),
-                "document": entry.purchase.invoice_number,
-            }
-            for entry in unit_004_portal_usage_events(db, rule)
-            if entry.event.portal_date <= today
-        ]
+        .order_by(PortalBonusEvent.portal_date, PortalBonusEvent.id)
+    ).all()
+    portal_credit_total = money(sum((Decimal(event.value or 0) for event in events), ZERO))
+    reconciliation_ids = [row.id for row in rows]
+    if uses_next_month_ipiranga_portal_credit(rule):
+        # Units 003 and 004 use a transparent calendar rule: every postpaid
+        # portal credit emitted in month M+1 belongs to competence M. It must
+        # remain visible even when it is lower or higher than expected.
+        identified = money(sum((Decimal(row.observed_value or 0) for row in rows), ZERO))
     else:
-        expected = money(sum((Decimal(row.expected_value or 0) for row in rows), ZERO))
-        events = db.scalars(
-            select(PortalBonusEvent)
-            .where(
-                PortalBonusEvent.unit_code == rule.unit_code,
-                PortalBonusEvent.company_code == rule.company_code,
-                PortalBonusEvent.category == "postpaid",
-                PortalBonusEvent.portal_date <= today,
-            )
-            .order_by(PortalBonusEvent.portal_date, PortalBonusEvent.id)
-        ).all()
-        portal_credit_total = money(sum((Decimal(event.value or 0) for event in events), ZERO))
-        reconciliation_ids = [row.id for row in rows]
         allocated_credit_values = (
             db.scalars(
                 select(ReconciliationAllocation.allocated_value)
@@ -295,16 +228,16 @@ def _ipiranga_cumulative_card(
             else []
         )
         # The portal wallet can retain a credit balance after a credit is split
-        # across contractual competences.  Only the allocated amount proves a
+        # across contractual competences. Only the allocated amount proves a
         # competence; the remaining wallet balance is informational.
         identified = money(sum((Decimal(value or 0) for value in allocated_credit_values), ZERO))
-        portal_unallocated = money(portal_credit_total - identified)
-        historical_adjustment = money(sum((Decimal(row.manual_adjustment or 0) for row in rows), ZERO))
-        credit_event_count = len(events)
-        credit_history = [
-            {"date": event.portal_date, "value": float(money(Decimal(event.value or 0))), "document": event.reference}
-            for event in events
-        ]
+    portal_unallocated = money(portal_credit_total - identified)
+    historical_adjustment = money(sum((Decimal(row.manual_adjustment or 0) for row in rows), ZERO))
+    credit_event_count = len(events)
+    credit_history = [
+        {"date": event.portal_date, "value": float(money(Decimal(event.value or 0))), "document": event.reference}
+        for event in events
+    ]
 
     # The operational card represents what has been reconciled, not only what
     # was emitted by the distributor. A historical adjustment is an audited
@@ -397,8 +330,8 @@ def _ipiranga_cumulative_card(
         "difference_value": float(effective_difference),
         "portal_difference_value": float(money(expected - portal_appropriated)),
         "portal_appropriated_value": float(portal_appropriated),
-        "portal_credit_total_value": float(portal_credit_total) if not is_unit_004_portal_credit_rule(rule) else float(portal_appropriated),
-        "portal_unallocated_value": float(portal_unallocated) if not is_unit_004_portal_credit_rule(rule) else 0.0,
+        "portal_credit_total_value": float(portal_credit_total),
+        "portal_unallocated_value": float(portal_unallocated),
         "historical_adjustment_value": float(historical_adjustment),
         "next_statement_expected_value": float(next_statement_expected),
         "credit_event_count": credit_event_count,
@@ -616,66 +549,6 @@ def build_monthly_routine(
                 continue
             source_type = _source_type(rule)
             if source_types and source_type not in source_types:
-                continue
-            if is_unit_004_portal_credit_rule(rule) and unit_004_portal_usage_events(db, rule):
-                as_of = min(month_end(reference_month), today)
-                snapshot = _unit_004_cumulative_snapshot(db, rule, as_of, today)
-                if snapshot["next_statement_expected"] > ZERO:
-                    situation = "awaiting_statement"
-                    action = "Aguardar próximo extrato"
-                    description = (
-                        f"Créditos confirmados no extrato Ipiranga: R$ {snapshot['identified']:,.2f}. "
-                        f"R$ {snapshot['next_statement_expected']:,.2f} das compras posteriores ao corte histórico "
-                        "aguardam o próximo extrato; isso não é cobrança por NF."
-                    )
-                elif snapshot["historical_adjustment_approved"]:
-                    situation = "automatic"
-                    action = "Conciliação acumulada concluída"
-                    description = (
-                        "O total de créditos Ipiranga foi conferido contra a bonificação calculada por volume. "
-                        "O ajuste histórico de R$ 69,99 permanece apenas como acompanhamento auditável."
-                    )
-                else:
-                    situation = "analysis"
-                    action = "Conferir saldo acumulado"
-                    description = (
-                        "Os créditos do portal foram somados, mas o saldo histórico ainda não corresponde ao ajuste "
-                        "aprovado de R$ 69,99. Importe o extrato que faltar antes de tratar como diferença."
-                    )
-                if situations and situation not in situations:
-                    continue
-                unit = unit_rows.get(rule.unit_code)
-                cards.append(
-                    {
-                        "id": f"{rule.id}:accumulated:{reference_month.isoformat()}",
-                        "rule_id": rule.id,
-                        "unit_code": rule.unit_code,
-                        "unit_name": unit.display_name if unit else f"Unidade {rule.unit_code}",
-                        "brand": unit.brand if unit else rule.company_code,
-                        "company_code": rule.company_code,
-                        "rule_kind": rule.kind,
-                        "rule_label": RULE_LABELS.get(rule.kind, rule.kind),
-                        "reference_month": reference_month,
-                        "due_date": None,
-                        "expected_value": float(snapshot["expected"]),
-                        "observed_value": float(snapshot["identified"]),
-                        "difference_value": float(snapshot["difference"]),
-                        "historical_expected_value": float(snapshot["historical_expected"]),
-                        "historical_identified_value": float(snapshot["historical_identified"]),
-                        "historical_adjustment_value": float(snapshot["historical_adjustment"]),
-                        "next_statement_expected_value": float(snapshot["next_statement_expected"]),
-                        "credit_count": snapshot["credit_count"],
-                        "reconciliation_id": None,
-                        "confirmation_mode": "automatic" if situation == "automatic" else "none",
-                        "source_type": source_type,
-                        "source": SOURCE_META[source_type],
-                        "situation": situation,
-                        "action": action,
-                        "description": description,
-                        "imports": [_import_payload(row, users) for row in imports_by_unit[rule.unit_code][:20]],
-                        "queue_url": "/conciliacoes?unit=004&state=confirmed",
-                    }
-                )
                 continue
             reconciliation = reconciliation_by_key.get((rule.id, reference_month))
             if reconciliation and reconciliation.status == "not_applicable":
