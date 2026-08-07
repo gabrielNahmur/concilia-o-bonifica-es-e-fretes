@@ -49,9 +49,10 @@ const routinePayload = {
     cumulative: true,
     as_of_date: "2026-06-30",
     expected_value: 300,
-    observed_value: 200,
+    observed_value: 300,
     difference_value: 0,
     portal_credit_total_value: 250,
+    portal_appropriated_value: 200,
     portal_unallocated_value: 50,
     portal_difference_value: 100,
     historical_adjustment_value: 100,
@@ -87,11 +88,13 @@ describe("monthly routine cumulative card", () => {
     });
   });
 
-  it("separates the residual wallet balance from the credits appropriated to competencies", async () => {
+  it("includes the audited historical adjustment in the appropriated credit total", async () => {
     render(<MemoryRouter><MonthlyRoutine user={{ id: "viewer", role: "viewer" }} /></MemoryRouter>);
 
     expect(await screen.findByText("Créditos apropriados")).toBeInTheDocument();
-    expect(screen.getByText("R$ 200,00")).toBeInTheDocument();
+    expect(screen.getAllByText("R$ 300,00")).toHaveLength(2);
+    expect(screen.getByText(/incluído em Créditos apropriados: R\$ 100,00/)).toBeInTheDocument();
+    expect(screen.getByText(/Créditos apropriados no portal: R\$ 200,00/)).toBeInTheDocument();
     expect(screen.getByText(/Crédito residual no portal: R\$ 50,00/)).toBeInTheDocument();
     expect(screen.getByText(/Créditos brutos emitidos: R\$ 250,00/)).toBeInTheDocument();
   });

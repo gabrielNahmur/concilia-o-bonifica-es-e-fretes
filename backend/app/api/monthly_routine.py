@@ -306,12 +306,18 @@ def _ipiranga_cumulative_card(
             for event in events
         ]
 
+    # The operational card represents what has been reconciled, not only what
+    # was emitted by the distributor. A historical adjustment is an audited
+    # component of that total, while the portal subtotal remains separate.
+    portal_appropriated = identified
+    identified = money(portal_appropriated + historical_adjustment)
+
     not_due_expected = money(
         sum((Decimal(row.expected_value or 0) for row in rows if row.due_date and row.due_date >= today), ZERO)
     )
     mature_expected = money(expected - not_due_expected)
-    effective_difference = money(expected - identified - historical_adjustment)
-    mature_difference = money(mature_expected - identified - historical_adjustment)
+    effective_difference = money(expected - identified)
+    mature_difference = money(mature_expected - identified)
     latest_import = max(
         imports,
         key=lambda item: (str(item.created_at or ""), item.period_end or date.min),
@@ -334,13 +340,17 @@ def _ipiranga_cumulative_card(
     elif abs(effective_difference) <= Decimal("0.01"):
         situation = "automatic"
         action = "Conciliação acumulada concluída"
-        description = "Os créditos postecipados do portal fecham o total calculado pela regra contratual."
-    elif not imports:
-        situation = "awaiting_statement" if identified > ZERO else "awaiting_source"
-        action = "Aguardar próximo extrato" if identified > ZERO else "Importar extrato ou relatório Ipiranga"
         description = (
-            "Já existem créditos históricos preservados, mas falta o extrato mais recente para atualizar o saldo acumulado."
-            if identified > ZERO
+            "Os créditos postecipados do portal e os ajustes históricos auditados fecham o total calculado pela regra contratual."
+            if historical_adjustment > ZERO
+            else "Os créditos postecipados do portal fecham o total calculado pela regra contratual."
+        )
+    elif not imports:
+        situation = "awaiting_statement" if portal_appropriated > ZERO else "awaiting_source"
+        action = "Aguardar próximo extrato" if portal_appropriated > ZERO else "Importar extrato ou relatório Ipiranga"
+        description = (
+            "Já existem créditos do portal preservados, mas falta o extrato mais recente para atualizar o saldo acumulado."
+            if portal_appropriated > ZERO
             else "Ainda não há extrato externo para comprovar os créditos postecipados acumulados."
         )
     elif abs(mature_difference) <= Decimal("0.01") and not_due_expected > ZERO:
@@ -366,7 +376,7 @@ def _ipiranga_cumulative_card(
         )
 
     adjustment_note = (
-        "Ajuste histórico aprovado, mantido separadamente da prova do portal."
+        "Ajuste histórico aprovado incluído em Créditos apropriados"
         if historical_adjustment > ZERO
         else None
     )
@@ -385,8 +395,9 @@ def _ipiranga_cumulative_card(
         "expected_value": float(expected),
         "observed_value": float(identified),
         "difference_value": float(effective_difference),
-        "portal_difference_value": float(money(expected - identified)),
-        "portal_credit_total_value": float(portal_credit_total) if not is_unit_004_portal_credit_rule(rule) else float(identified),
+        "portal_difference_value": float(money(expected - portal_appropriated)),
+        "portal_appropriated_value": float(portal_appropriated),
+        "portal_credit_total_value": float(portal_credit_total) if not is_unit_004_portal_credit_rule(rule) else float(portal_appropriated),
         "portal_unallocated_value": float(portal_unallocated) if not is_unit_004_portal_credit_rule(rule) else 0.0,
         "historical_adjustment_value": float(historical_adjustment),
         "next_statement_expected_value": float(next_statement_expected),

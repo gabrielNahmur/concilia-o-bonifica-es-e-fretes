@@ -237,8 +237,8 @@ def test_monthly_routine_aggregates_ipiranga_statement_units_once_per_rule():
         assert cards[0]["imports"][0]["original_filename"] == "extrato-003.pdf"
 
 
-def test_monthly_routine_cumulative_uses_allocated_portal_credit_not_residual_wallet_balance():
-    """A portal residual cannot make a fully appropriated wallet look divergent."""
+def test_monthly_routine_cumulative_includes_audited_historical_adjustment_in_observed_total():
+    """The operational total includes an audited adjustment without inflating portal credit."""
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -362,11 +362,13 @@ def test_monthly_routine_cumulative_uses_allocated_portal_credit_not_residual_wa
         )
         card = next(row for row in payload["cards"] if row["unit_code"] == "003")
 
-        assert card["observed_value"] == 200.0
+        assert card["observed_value"] == 300.0
+        assert card["portal_appropriated_value"] == 200.0
         assert card["portal_credit_total_value"] == 250.0
         assert card["portal_unallocated_value"] == 50.0
         assert card["difference_value"] == 0.0
         assert card["situation"] == "automatic"
+        assert "ajustes históricos auditados" in card["description"]
 
 
 def test_monthly_routine_exposes_the_latest_import_and_issued_credit_dates_separately():
@@ -725,7 +727,8 @@ def test_monthly_routine_004_separates_historical_residual_from_next_statement()
 
         assert card["historical_adjustment_value"] == 69.99
         assert card["next_statement_expected_value"] == 700.0
-        assert card["observed_value"] == 78470.01
+        assert card["observed_value"] == 78540.0
+        assert card["portal_appropriated_value"] == 78470.01
         assert card["situation"] == "awaiting_statement"
 
 
