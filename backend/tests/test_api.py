@@ -191,6 +191,74 @@ def test_work_queue_is_deduplicated_and_hides_confirmed_by_default():
         assert any(row["reference_month"] == "2031-02-01" for row in history.json()["items"])
 
 
+def test_work_queue_exposes_native_discount_for_late_payment_without_counting_it():
+    Base.metadata.create_all(engine)
+    with SessionLocal() as db:
+        seed_reference_data(db)
+        user = db.scalar(select(User).where(User.email == "late.queue@gbi.com"))
+        if not user:
+            user = User(
+                email="late.queue@gbi.com",
+                full_name="Consulta de Atraso",
+                role="viewer",
+                active=True,
+                must_change_password=False,
+                password_hash=hash_password("SenhaSegura123!"),
+            )
+            db.add(user)
+        rule = db.scalar(
+            select(BonusRule).where(BonusRule.unit_code == "050", BonusRule.kind == "invoice_discount")
+        )
+        reconciliation = Reconciliation(
+            unit_code="050",
+            rule_id=rule.id,
+            reference_month=date(2032, 8, 1),
+            due_date=date(2032, 8, 3),
+            expected_value=Decimal("0"),
+            observed_value=Decimal("0"),
+            manual_adjustment=Decimal("0"),
+            difference_value=Decimal("0"),
+            status="late_payment",
+            confidence="direct",
+            evidence_json="[]",
+        )
+        db.add(reconciliation)
+        db.flush()
+        db.add(
+            ReconciliationItem(
+                reconciliation_id=reconciliation.id,
+                item_type="invoice",
+                source_key="late-payment:3096076",
+                source_date=date(2032, 8, 1),
+                source_document="3096076",
+                description="NF 3096076 - pagamento em atraso; desconto não aplicável",
+                expected_value=Decimal("0"),
+                observed_value=Decimal("0"),
+                difference_value=Decimal("0"),
+                status="late_payment",
+                confidence="direct",
+                automatic_eligible=False,
+                review_status="pending",
+                policy_reason="Título liquidado 4 dia(s) após o vencimento; desconto contratual não aplicável.",
+                details_json='{"raw_discount_value": 920, "contractual_expected_value": 920, "lost_due_to_late_payment": true}',
+                fingerprint="late-payment-3096076",
+            )
+        )
+        db.commit()
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/auth/login", json={"email": "late.queue@gbi.com", "password": "SenhaSegura123!"}
+        ).status_code == 200
+        response = client.get("/api/reconciliations/work-queue?unit=050&scope=confirmed")
+        assert response.status_code == 200
+        row = next(item for item in response.json()["items"] if item["document"] == "3096076")
+        assert row["status"] == "late_payment"
+        assert row["observed_value"] == 0.0
+        assert row["difference_value"] == 0.0
+        assert row["identified_discount_value"] == 920.0
+
+
 def test_admin_confirmation_creates_immutable_review_snapshot():
     Base.metadata.create_all(engine)
     with TestClient(app) as client:

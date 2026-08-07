@@ -1180,6 +1180,11 @@ def build_reconciliation_detail(db: Session, row: Reconciliation, rule: BonusRul
                     "expected_value": _number(item.expected_value),
                     "observed_value": _number(item.observed_value),
                     "difference_value": _number(item.difference_value),
+                    "identified_discount_value": (
+                        _number(_decimal(json.loads(item.details_json or "{}").get("raw_discount_value")))
+                        if item.status == "late_payment"
+                        else None
+                    ),
                     "status": item.status,
                     "confidence": item.confidence,
                     "automatic_eligible": item.automatic_eligible,

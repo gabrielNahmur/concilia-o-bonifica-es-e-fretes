@@ -2679,6 +2679,13 @@ export function QueueChain({ detail, row, activeItem }) {
     portalCredit && activeItem?.details?.portal_postpaid_exact && activeItem?.status === "auto_confirmed",
   );
   const portalUsage = activeItem?.item_type === "portal_credit_usage" || row.item_type === "portal_credit_usage";
+  const lateDiscountValue = Number(
+    activeItem?.identified_discount_value
+      ?? activeItem?.details?.raw_discount_value
+      ?? row.identified_discount_value
+      ?? 0,
+  );
+  const hasLateDiscount = row.status === "late_payment" && lateDiscountValue > 0;
 
   if (portalUsage) {
     const usageEvidence = activeItem?.display_evidence?.find(
@@ -2738,9 +2745,9 @@ export function QueueChain({ detail, row, activeItem }) {
         </div>
         <ChevronRight />
         <div className="queue-chain-node">
-          <span>{portalCredit ? "4. Crédito no portal" : "4. Desconto"}</span>
-          <strong>{money(portalCredit?.value ?? selectedChain?.actual_discount ?? 0)}</strong>
-          <small>{portalCredit ? "Extrato do portal confirma a bonificação desta NF" : `Esperado ${money(selectedChain?.purchase?.expected_bonus || row.expected_value)}`}</small>
+          <span>{hasLateDiscount ? "4. Desconto identificado no ERP" : portalCredit ? "4. Crédito no portal" : "4. Desconto"}</span>
+          <strong>{money(hasLateDiscount ? lateDiscountValue : portalCredit?.value ?? selectedChain?.actual_discount ?? 0)}</strong>
+          <small>{hasLateDiscount ? "Não apropriado por atraso na baixa." : portalCredit ? "Extrato do portal confirma a bonificação desta NF" : `Esperado ${money(selectedChain?.purchase?.expected_bonus || row.expected_value)}`}</small>
         </div>
       </div>
     );
@@ -2955,7 +2962,7 @@ function QueueReconciliationDetail({ row, user, onClose, onChanged }) {
                 </div>
                 <div className="queue-detail-values">
                 <div><span>{row.status === "late_payment" ? "Benefício não aplicável" : "Esperado"}</span><strong>{money(row.status === "late_payment" ? row.contractual_value : row.expected_value)}</strong></div>
-                  <div><span>{hasManagementAdjustment ? "Ajuste aprovado" : "Identificado"}</span><strong>{money(row.observed_value)}</strong></div>
+                  <div><span>{hasManagementAdjustment ? "Ajuste aprovado" : row.status === "late_payment" && Number(row.identified_discount_value) > 0 ? "Desconto identificado no ERP" : "Identificado"}</span><strong>{money(row.status === "late_payment" && Number(row.identified_discount_value) > 0 ? row.identified_discount_value : row.observed_value)}</strong></div>
                   <div className={Math.abs(Number(row.difference_value)) > 0.01 ? "negative" : ""}><span>Diferença</span><strong>{money(row.difference_value)}</strong></div>
                   <div><span>{row.rule_kind === "invoice_discount" ? "Vencimento do título" : "Vencimento"}</span><strong>{d(row.due_date)}</strong></div>
                 </div>
@@ -3131,7 +3138,7 @@ function ReconciliationQueuePanel({ user }) {
             <article className={`queue-row priority-${item.priority}`} key={item.id}>
               <div className="queue-priority"><span>{priorityLabels[item.priority]}</span><strong>{item.unit_code}</strong></div>
               <div className="queue-main"><strong>{item.document ? `NF ${item.document}` : month(item.reference_month)}</strong><span><BrandLogo brand={unitByCode[item.unit_code]?.brand || item.company_code} compact /> {unitName(unitByCode[item.unit_code], `Unidade ${item.unit_code}`)} • {ruleLabels[item.rule_kind] || item.rule_kind}</span><small>{item.description}</small></div>
-              <div className="queue-values"><div><span>{item.status === "late_payment" ? "Benefício não aplicável" : "Esperado"}</span><strong>{money(item.status === "late_payment" ? item.contractual_value : item.expected_value)}</strong></div><div><span>Identificado</span><strong>{money(item.observed_value)}</strong></div><div className={Math.abs(Number(item.difference_value)) > 0.01 ? "negative" : ""}><span>Diferença</span><strong>{money(item.difference_value)}</strong></div></div>
+              <div className="queue-values"><div><span>{item.status === "late_payment" ? "Benefício não aplicável" : "Esperado"}</span><strong>{money(item.status === "late_payment" ? item.contractual_value : item.expected_value)}</strong></div><div><span>{item.status === "late_payment" && Number(item.identified_discount_value) > 0 ? "Desconto identificado no ERP" : "Identificado"}</span><strong>{money(item.status === "late_payment" && Number(item.identified_discount_value) > 0 ? item.identified_discount_value : item.observed_value)}</strong></div><div className={Math.abs(Number(item.difference_value)) > 0.01 ? "negative" : ""}><span>Diferença</span><strong>{money(item.difference_value)}</strong></div></div>
               <div className="queue-missing"><Badge status={item.status} /><strong>{item.action_label}</strong><span>{item.reason}</span><small>Vence {d(item.due_date)}{item.open_exception_count ? ` • ${item.open_exception_count} alerta(s)` : ""}</small></div>
               <button className="secondary queue-open" onClick={() => setSelected({ ...item, unit: unitByCode[item.unit_code] })}><Eye /> Conferir</button>
             </article>

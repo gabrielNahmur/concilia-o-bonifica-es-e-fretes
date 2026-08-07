@@ -5,6 +5,49 @@ import { QueueChain } from "./App";
 
 
 describe("QueueChain", () => {
+  it("mostra o desconto lançado no ERP mesmo quando a baixa foi registrada em atraso", () => {
+    render(
+      <QueueChain
+        row={{
+          document: "3096076",
+          item_type: "invoice",
+          rule_kind: "invoice_discount",
+          status: "late_payment",
+          expected_value: 0,
+          observed_value: 0,
+          identified_discount_value: 920,
+        }}
+        activeItem={{
+          item_type: "invoice",
+          status: "late_payment",
+          expected_value: 0,
+          observed_value: 0,
+          details: { raw_discount_value: 920 },
+        }}
+        detail={{
+          reference_month: "2026-08-01",
+          expected_value: 0,
+          observed_value: 0,
+          manual_adjustment: 0,
+          evidence: [],
+          chains: [
+            {
+              purchase: { invoice_number: "3096076", expected_bonus: 920 },
+              actual_discount: 0,
+              documents: [],
+            },
+          ],
+          match_summary: { purchase_count: 1 },
+          rule: { formula: "R$ 0,040000/L" },
+        }}
+      />,
+    );
+
+    expect(screen.getByText("4. Desconto identificado no ERP")).toBeInTheDocument();
+    expect(screen.getByText("Não apropriado por atraso na baixa.")).toBeInTheDocument();
+    expect(screen.getByText("R$ 920,00")).toBeInTheDocument();
+  });
+
   it("descreve uso de crédito da 004 sem apresentar o esperado mensal como prova", () => {
     render(
       <QueueChain

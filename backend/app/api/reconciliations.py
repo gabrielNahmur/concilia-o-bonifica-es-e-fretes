@@ -672,6 +672,11 @@ def reconciliation_work_queue(
                     "expected_value": float(money(expected)),
                     "observed_value": float(money(observed)),
                     "difference_value": float(money(difference)),
+                    "identified_discount_value": (
+                        float(money(Decimal(str(details.get("raw_discount_value") or 0))))
+                        if status == "late_payment"
+                        else None
+                    ),
                     "contractual_value": (
                         float(money(Decimal(str(details.get("contractual_expected_value") or 0))))
                         if status == "late_payment"

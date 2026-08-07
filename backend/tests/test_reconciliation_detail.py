@@ -192,6 +192,60 @@ def test_accounting_evidence_uses_manager_friendly_raizen_account_labels():
     assert _account_label("1110202000001") == "Banco Bradesco C/C (1110202000001)"
 
 
+def test_detail_exposes_native_discount_for_late_payment_without_counting_it():
+    engine = create_engine("sqlite:///:memory:")
+    Base.metadata.create_all(engine)
+    with Session(engine) as db:
+        seed_reference_data(db)
+        rule = db.scalar(
+            select(BonusRule).where(BonusRule.unit_code == "050", BonusRule.kind == "invoice_discount")
+        )
+        reconciliation = Reconciliation(
+            unit_code="050",
+            rule_id=rule.id,
+            reference_month=date(2026, 8, 1),
+            due_date=date(2026, 8, 3),
+            expected_value=Decimal("0"),
+            observed_value=Decimal("0"),
+            manual_adjustment=Decimal("0"),
+            difference_value=Decimal("0"),
+            status="late_payment",
+            confidence="direct",
+            evidence_json="[]",
+        )
+        db.add(reconciliation)
+        db.flush()
+        db.add(
+            ReconciliationItem(
+                reconciliation_id=reconciliation.id,
+                item_type="invoice",
+                source_key="late-detail:3096076",
+                source_date=date(2026, 8, 1),
+                source_document="3096076",
+                description="NF 3096076 - pagamento em atraso; desconto não aplicável",
+                expected_value=Decimal("0"),
+                observed_value=Decimal("0"),
+                difference_value=Decimal("0"),
+                status="late_payment",
+                confidence="direct",
+                automatic_eligible=False,
+                review_status="pending",
+                policy_reason="Título liquidado 4 dia(s) após o vencimento; desconto contratual não aplicável.",
+                details_json='{"raw_discount_value": 920, "contractual_expected_value": 920, "lost_due_to_late_payment": true}',
+                fingerprint="late-detail-3096076",
+            )
+        )
+        db.commit()
+
+        detail = build_reconciliation_detail(db, reconciliation, rule)
+        item = detail["workspace"]["items"][0]
+
+        assert item["status"] == "late_payment"
+        assert item["observed_value"] == 0.0
+        assert item["difference_value"] == 0.0
+        assert item["identified_discount_value"] == 920.0
+
+
 def test_distributor_credit_calls_native_discount_credit_utilization():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
