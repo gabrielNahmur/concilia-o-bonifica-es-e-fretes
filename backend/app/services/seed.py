@@ -73,10 +73,10 @@ RULES = [
     # A postecipada da 008 foi comprovada no relatório de parcelas emitido
     # pelo portal Ipiranga. Os ciclos próprios começam em 27/06/2022.
     ("008", "IPIRANGA", "distributor_credit", date(2022, 6, 27), "0.05", None, None, None, None, None, 1, "all_fuel"),
-    ("005", "TEXACO", "invoice_discount", date(2025, 7, 31), "0.04", None, None, None, None, None, 0, "fuel_codes:1,2,3,4,5,9"),
+    ("005", "TEXACO", "invoice_discount", date(2025, 7, 31), "0.04", None, None, None, None, None, 0, "fuel_codes:1,3,5"),
     ("006", "BR", "milestone_bonus", date(2025, 2, 1), "0", None, "440000", "35000", 4, None, 1, "all_fuel"),
-    ("007", "TEXACO", "invoice_discount", date(2025, 9, 10), "0.04", None, None, None, None, None, 0, "fuel_codes:1,2,3,4,5,9"),
-    ("014", "TEXACO", "invoice_discount", date(2026, 4, 22), "0.04", None, None, None, None, None, 0, "fuel_codes:1,2,3,4,5,9"),
+    ("007", "TEXACO", "invoice_discount", date(2025, 9, 10), "0.04", None, None, None, None, None, 0, "fuel_codes:1,3,5"),
+    ("014", "TEXACO", "invoice_discount", date(2026, 4, 22), "0.04", None, None, None, None, None, 0, "fuel_codes:1,3,5"),
     # A primeira NF da 050 que recebeu integralmente R$0,04/L foi emitida em
     # 15/05/2026 e quitada com Nota PrÃ³pria no portal em 18/05. Antes disso o
     # portal nÃ£o mostra a rotina regular de desconto.
@@ -168,7 +168,7 @@ def seed_reference_data(db: Session) -> None:
             )
         )
         if rule:
-            rule.applies_to = "fuel_codes:1,2,3,4,5,9"
+            rule.applies_to = "fuel_codes:1,3,5"
 
     # A vigÃªncia acima foi confirmada depois da criaÃ§Ã£o da base inicial. O
     # ajuste idempotente evita que uma reinstalaÃ§Ã£o volte a cobrar descontos

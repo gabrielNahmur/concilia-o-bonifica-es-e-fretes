@@ -45,7 +45,7 @@ from app.scripts.apply_unit_001_mar_2025_management_adjustment import (
 )
 
 
-def test_texaco_invoice_discount_rules_include_all_contract_fuel_codes():
+def test_texaco_invoice_discount_rules_keep_documented_fuel_scope():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -58,9 +58,9 @@ def test_texaco_invoice_discount_rules_include_all_contract_fuel_codes():
         ).scalars().all()
 
         assert {rule.unit_code: rule.applies_to for rule in rules} == {
-            "005": "fuel_codes:1,2,3,4,5,9",
-            "007": "fuel_codes:1,2,3,4,5,9",
-            "014": "fuel_codes:1,2,3,4,5,9",
+            "005": "fuel_codes:1,3,5",
+            "007": "fuel_codes:1,3,5",
+            "014": "fuel_codes:1,3,5",
         }
 
 

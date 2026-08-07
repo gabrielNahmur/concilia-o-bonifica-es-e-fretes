@@ -93,7 +93,7 @@ def test_parser_extracts_explicit_discount_and_document_identity():
     assert parsed.due_date == date(2026, 7, 13)
 
 
-def test_import_marks_boleto_without_aditivada_discount_as_mismatch():
+def test_import_links_boleto_to_exact_note_title_for_documented_fuel_scope():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -108,14 +108,14 @@ def test_import_marks_boleto_without_aditivada_discount_as_mismatch():
             uploaded_by="admin-test",
         )
         assert duplicate is False
-        assert evidence.match_status == "mismatch"
+        assert evidence.match_status == "exact"
         assert evidence.purchase_entry_id == 900096793
         assert evidence.payable_document_id is not None
-        assert evidence.expected_discount_value == Decimal("1480.00")
+        assert evidence.expected_discount_value == Decimal("1080.00")
         assert evidence.net_value == Decimal("195814.20")
 
 
-def test_import_links_boleto_to_exact_note_title_when_all_contract_fuels_are_discounted():
+def test_import_marks_boleto_above_documented_fuel_scope_as_mismatch():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(engine)
     with Session(engine) as db:
@@ -131,5 +131,5 @@ def test_import_links_boleto_to_exact_note_title_when_all_contract_fuels_are_dis
         )
 
         assert duplicate is False
-        assert evidence.match_status == "exact"
-        assert evidence.expected_discount_value == Decimal("1480.00")
+        assert evidence.match_status == "mismatch"
+        assert evidence.expected_discount_value == Decimal("1080.00")
