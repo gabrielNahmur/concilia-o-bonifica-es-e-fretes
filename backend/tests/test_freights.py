@@ -148,7 +148,7 @@ def _payable(erp_cte_id, unit, value, sequence="01"):
     )
 
 
-def test_freight_v2_uses_invoice_liters_and_classifies_cent_differences():
+def test_freight_v2_uses_invoice_liters_without_auxiliary_cargo_alerts():
     local_engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(local_engine)
     with Session(local_engine) as db:
@@ -175,7 +175,7 @@ def test_freight_v2_uses_invoice_liters_and_classifies_cent_differences():
             row = db.scalar(select(FreightReconciliation).where(FreightReconciliation.erp_cte_id == erp_id))
             assert row.matched_liters == Decimal(liters).quantize(Decimal("0.001"))
             assert row.primary_status == expected_status
-            assert any(issue["code"] == "cargo_volume_mismatch" for issue in json.loads(row.issues_json))
+            assert not any(issue["code"] == "cargo_volume_mismatch" for issue in json.loads(row.issues_json))
 
 
 def test_seed_bootstraps_rates_once_and_never_overwrites_manager_changes():

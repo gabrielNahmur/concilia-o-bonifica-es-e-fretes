@@ -675,14 +675,9 @@ def rebuild_freight_reconciliations(db: Session) -> int:
                     "warning",
                 )
             )
-        if cte.cargo_liters and matched_liters and _liters(cte.cargo_liters) != matched_liters:
-            issues.append(
-                _issue(
-                    "cargo_volume_mismatch",
-                    f"Carga declara {_liters(cte.cargo_liters)} L; NF-e comprova {matched_liters} L. A NF-e prevalece.",
-                    "info",
-                )
-            )
+        # The freight calculation and operational view use only the volume
+        # proven by linked NF-es.  The auxiliary CT-e cargo field is kept in
+        # the raw snapshot, but does not create a reconciliation warning.
         if not title_rows:
             linkage = "Cd_CTe" if cte.source_kind == "mcte" else "Cd_Entrada"
             issues.append(_issue("missing_payable", f"Não foi encontrado título vinculado pelo {linkage}.", "warning"))
