@@ -438,6 +438,45 @@ def _queue_state(status: str, due_date: date | None = None) -> str:
     return "actionable"
 
 
+DETAILED_QUEUE_SITUATIONS = {
+    "overpaid",
+    "underpaid",
+    "pending",
+    "overdue",
+    "confirmed",
+    "late_payment",
+    "in_review",
+    "approved_adjustment",
+}
+LEGACY_QUEUE_STATES = {"actionable", "waiting", "confirmed"}
+
+
+def _queue_situation(
+    status: str,
+    state: str,
+    observed: Decimal,
+    difference: Decimal,
+    in_review: bool,
+    has_management_adjustment: bool,
+) -> str:
+    """Return one explicit operational label without changing the financial result."""
+    if has_management_adjustment:
+        return "approved_adjustment"
+    if in_review or status == "review_required":
+        return "in_review"
+    if status == "late_payment":
+        return "late_payment"
+    if status == "overdue":
+        return "overdue"
+    if state == "confirmed":
+        return "confirmed"
+    if observed > Decimal("0.00") and difference < Decimal("-0.01"):
+        return "overpaid"
+    if observed > Decimal("0.00") and difference > Decimal("0.01"):
+        return "underpaid"
+    return "pending"
+
+
 def _effective_item_due_date(
     item: ReconciliationItem | None,
     fallback: date | None,
@@ -562,7 +601,7 @@ def reconciliation_work_queue(
     rule_kinds = set(_filter_values(rule_kind))
     reference_months = _filter_months(reference_month)
     states = set(_filter_values(state))
-    allowed_states = {"actionable", "waiting", "confirmed"}
+    allowed_states = LEGACY_QUEUE_STATES | DETAILED_QUEUE_SITUATIONS
     invalid_states = states - allowed_states
     if invalid_states:
         raise HTTPException(
@@ -656,6 +695,15 @@ def reconciliation_work_queue(
             severity = min((QUEUE_PRIORITY.get(entry.severity, 3) for entry in related_exceptions), default=None)
             if severity is None:
                 severity = 0 if status in {"overdue", "divergent"} else 2 if state == "actionable" else 3 if state == "waiting" else 4
+            in_review = any(entry.status == "in_review" for entry in related_exceptions)
+            situation = _queue_situation(
+                status,
+                state,
+                observed,
+                difference,
+                in_review,
+                has_management_adjustment,
+            )
             rows.append(
                 {
                     "id": item.id if item else reconciliation.id,
@@ -685,6 +733,7 @@ def reconciliation_work_queue(
                     "due_date": effective_due_date,
                     "status": status,
                     "state": state,
+                    "situation": situation,
                     "priority": next((name for name, value in QUEUE_PRIORITY.items() if value == severity), "low"),
                     "reason": _queue_reason(
                         rule, status, details, related_exceptions, has_management_adjustment
@@ -693,7 +742,7 @@ def reconciliation_work_queue(
                         rule, state, status, details, related_exceptions, has_management_adjustment
                     ),
                     "open_exception_count": len(related_exceptions),
-                    "in_review": any(entry.status == "in_review" for entry in related_exceptions),
+                    "in_review": in_review,
                     "confirmation_mode": reconciliation.confirmation_mode,
                 }
             )
@@ -708,7 +757,16 @@ def reconciliation_work_queue(
         "confirmed_value": float(sum((Decimal(str(item["observed_value"])) for item in rows if item["state"] == "confirmed"), Decimal("0"))),
     }
     if states:
-        rows = [item for item in rows if item["state"] in states]
+        legacy_states = states & (LEGACY_QUEUE_STATES - {"confirmed"})
+        detailed_situations = states & DETAILED_QUEUE_SITUATIONS
+        rows = [
+            item
+            for item in rows
+            if (
+                item["state"] in legacy_states
+                or item["situation"] in detailed_situations
+            )
+        ]
     elif scope != "all":
         rows = [item for item in rows if item["state"] == scope]
     # The queue is a current operational view: newest competence/NF first.

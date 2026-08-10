@@ -259,6 +259,95 @@ def test_work_queue_exposes_native_discount_for_late_payment_without_counting_it
         assert row["identified_discount_value"] == 920.0
 
 
+def test_work_queue_filters_by_detailed_situation():
+    Base.metadata.create_all(engine)
+    with SessionLocal() as db:
+        seed_reference_data(db)
+        user = db.scalar(select(User).where(User.email == "situations.queue@gbi.com"))
+        if not user:
+            user = User(
+                email="situations.queue@gbi.com",
+                full_name="Consulta de situaÃ§Ãµes",
+                role="viewer",
+                active=True,
+                must_change_password=False,
+                password_hash=hash_password("SenhaSegura123!"),
+            )
+            db.add(user)
+        rule = db.scalar(
+            select(BonusRule).where(BonusRule.unit_code == "001", BonusRule.kind == "distributor_credit")
+        )
+        rows = [
+            ("OVER", "divergent", "100", "120", "-20", date(2034, 1, 31), "[]"),
+            ("UNDER", "divergent", "100", "80", "20", date(2034, 2, 28), "[]"),
+            ("PENDING", "pending", "100", "0", "100", date(2034, 3, 31), "[]"),
+            ("OVERDUE", "overdue", "100", "0", "100", date(2034, 4, 30), "[]"),
+            ("CONFIRMED", "confirmed", "100", "100", "0", date(2034, 5, 31), "[]"),
+            ("LATE", "late_payment", "0", "0", "0", date(2034, 6, 30), "[]"),
+            ("REVIEW", "review_required", "100", "0", "100", date(2034, 7, 31), "[]"),
+            (
+                "ADJUSTMENT", "confirmed", "100", "0", "0", date(2034, 8, 31),
+                '[{"source":"MANAGEMENT_ADJUSTMENT","amount":100}]',
+            ),
+        ]
+        records = []
+        for index, (label, status, expected, observed, difference, due_date, evidence) in enumerate(rows, start=1):
+            record = Reconciliation(
+                unit_code="001",
+                rule_id=rule.id,
+                reference_month=date(2034, index, 1),
+                due_date=due_date,
+                expected_value=Decimal(expected),
+                observed_value=Decimal(observed),
+                manual_adjustment=Decimal("0"),
+                difference_value=Decimal(difference),
+                status=status,
+                confidence="direct",
+                evidence_json=evidence,
+            )
+            db.add(record)
+            records.append((label, record))
+        db.flush()
+        review = next(record for label, record in records if label == "REVIEW")
+        db.add(
+            ReconciliationException(
+                reconciliation_id=review.id,
+                source_key="situations:review",
+                exception_type="manual_review_required",
+                severity="high",
+                status="in_review",
+                title="RevisÃ£o iniciada",
+                description="Aguardando decisÃ£o humana.",
+                expected_value=Decimal("100"),
+                observed_value=Decimal("0"),
+                difference_value=Decimal("100"),
+            )
+        )
+        db.commit()
+
+    with TestClient(app) as client:
+        assert client.post(
+            "/api/auth/login", json={"email": "situations.queue@gbi.com", "password": "SenhaSegura123!"}
+        ).status_code == 200
+        expected_months = {
+            "overpaid": "2034-01-01",
+            "underpaid": "2034-02-01",
+            "pending": "2034-03-01",
+            "overdue": "2034-04-01",
+            "confirmed": "2034-05-01",
+            "late_payment": "2034-06-01",
+            "in_review": "2034-07-01",
+            "approved_adjustment": "2034-08-01",
+        }
+        for situation, reference_month in expected_months.items():
+            response = client.get(f"/api/reconciliations/work-queue?unit=001&state={situation}")
+            assert response.status_code == 200
+            filtered_rows = response.json()["items"]
+            assert all(row["situation"] == situation for row in filtered_rows)
+            rows = [row for row in filtered_rows if row["reference_month"] == reference_month]
+            assert len(rows) == 1
+
+
 def test_admin_confirmation_creates_immutable_review_snapshot():
     Base.metadata.create_all(engine)
     with TestClient(app) as client:

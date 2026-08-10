@@ -3068,11 +3068,12 @@ function ReconciliationQueuePanel({ user }) {
   const [company, setCompany] = useState(() => queryValues("company"));
   const [ruleKind, setRuleKind] = useState(() => queryValues("rule_kind"));
   const [reference, setReference] = useState(() => queryValues("reference_month"));
+  const defaultOperationalSituations = ["pending", "underpaid", "overpaid", "overdue", "in_review"];
   const initialStates = () => {
     const values = queryValues("state");
     if (values.length) return values;
     const legacyScope = queryValues("scope")[0];
-    return legacyScope && legacyScope !== "all" ? [legacyScope] : ["actionable"];
+    return legacyScope && legacyScope !== "all" ? [legacyScope] : defaultOperationalSituations;
   };
   const [states, setStates] = useState(initialStates);
   const [page, setPage] = useState(1);
@@ -3105,15 +3106,25 @@ function ReconciliationQueuePanel({ user }) {
   }, [location.search]);
   useEffect(() => { load(); }, [unit, company, ruleKind, reference, states, page]);
   const updateFilter = (setter) => (value) => { setPage(1); setSelected(null); setter(value); };
-  const onlyActionable = states.length === 1 && states[0] === "actionable";
+  const usingOperationalDefaults = states.length === defaultOperationalSituations.length
+    && defaultOperationalSituations.every((value) => states.includes(value));
   const waitingCount = Number(data?.summary?.waiting || 0);
-  const emptyText = onlyActionable ? "Não há itens que exijam ação nos filtros selecionados." : "Nenhum item para os filtros selecionados.";
+  const emptyText = usingOperationalDefaults ? "Não há itens que exijam ação nos filtros selecionados." : "Nenhum item para os filtros selecionados.";
   const monthOptions = rollingMonthOptions();
   const unitOptions = units.map((row) => ({ value: row.code, label: `${row.code} • ${unitName(row)}` }));
   const unitByCode = Object.fromEntries(units.map((row) => [row.code, row]));
   const companyOptions = [{ value: "IPIRANGA", label: "Ipiranga" }, { value: "BR", label: "BR / Vibra" }, { value: "SHELL", label: "Shell / Raízen" }, { value: "TEXACO", label: "Texaco" }];
   const ruleOptions = Object.entries(ruleLabels).map(([value, label]) => ({ value, label }));
-  const stateOptions = [{ value: "actionable", label: "Para tratar" }, { value: "waiting", label: "Aguardando" }, { value: "confirmed", label: "Confirmados" }];
+  const stateOptions = [
+    { value: "overpaid", label: "Pago maior" },
+    { value: "underpaid", label: "Pago menor" },
+    { value: "pending", label: "Pendentes" },
+    { value: "overdue", label: "Vencidos" },
+    { value: "confirmed", label: "Confirmados" },
+    { value: "late_payment", label: "Pago em atraso" },
+    { value: "in_review", label: "Em análise" },
+    { value: "approved_adjustment", label: "Ajuste aprovado" },
+  ];
   return (
     <>
       {error && <div className="form-error">{error}</div>}
@@ -3144,7 +3155,7 @@ function ReconciliationQueuePanel({ user }) {
             </article>
           ))}
         </section>
-      ) : onlyActionable && waitingCount > 0 ? <section className="queue-waiting-context"><Empty text="Não há pendência financeira para tratar nos filtros selecionados." /><div className="queue-waiting-actions"><Clock3 /><span>Há {n(waitingCount)} item(ns) aguardando vencimento, baixa ou arquivo externo.</span><button className="secondary" type="button" onClick={() => updateFilter(setStates)(["waiting"])}>Ver itens aguardando</button></div></section> : <Empty text={emptyText} />}
+      ) : usingOperationalDefaults && waitingCount > 0 ? <section className="queue-waiting-context"><Empty text="Não há pendência financeira para tratar nos filtros selecionados." /><div className="queue-waiting-actions"><Clock3 /><span>Há {n(waitingCount)} item(ns) aguardando vencimento, baixa ou arquivo externo.</span><button className="secondary" type="button" onClick={() => updateFilter(setStates)(["waiting"])}>Ver itens aguardando</button></div></section> : <Empty text={emptyText} />}
       {data?.pages > 1 && <div className="pagination"><button className="secondary" disabled={page <= 1} onClick={() => setPage((value) => value - 1)}>Anterior</button><span>Página {page} de {data.pages}</span><button className="secondary" disabled={page >= data.pages} onClick={() => setPage((value) => value + 1)}>Próxima</button></div>}
       {selected && <QueueReconciliationDetail row={selected} user={user} onClose={() => setSelected(null)} onChanged={load} />}
     </>

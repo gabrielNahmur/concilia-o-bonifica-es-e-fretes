@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -129,5 +129,27 @@ describe("reconciliation queue navigation", () => {
     expect(screen.queryByRole("button", { name: "Exceções", exact: true })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Competências", exact: true })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Cobertura automática", exact: true })).not.toBeInTheDocument();
+  });
+
+  it("exposes detailed financial situations and loads the operational default set", async () => {
+    render(
+      <MemoryRouter initialEntries={["/conciliacoes"]}>
+        <Reconciliations user={user} />
+      </MemoryRouter>,
+    );
+
+    await screen.findByRole("heading");
+    const situationTrigger = screen.getByText(/Situa/).parentElement.querySelector("button");
+    fireEvent.click(situationTrigger);
+
+    expect(screen.getByText("Pago maior")).toBeInTheDocument();
+    expect(screen.getByText("Pago menor")).toBeInTheDocument();
+    expect(screen.getByText("Pago em atraso")).toBeInTheDocument();
+    expect(screen.getByText("Ajuste aprovado")).toBeInTheDocument();
+    await waitFor(() => expect(get).toHaveBeenCalledWith(expect.stringContaining("state=pending")));
+    expect(get).toHaveBeenCalledWith(expect.stringContaining("state=overpaid"));
+    expect(get).toHaveBeenCalledWith(expect.stringContaining("state=underpaid"));
+    expect(get).toHaveBeenCalledWith(expect.stringContaining("state=overdue"));
+    expect(get).toHaveBeenCalledWith(expect.stringContaining("state=in_review"));
   });
 });
